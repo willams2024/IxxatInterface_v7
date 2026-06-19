@@ -823,6 +823,9 @@ class DiscoveryEngine:
         self._phase_start = 0.0           # instante (time.time) de início da fase.
         self.results: list[CandidateSignal] = []   # candidatos da última análise.
         self.progress = 0.0  # 0-1        # progresso global do teste (0 a 1).
+        # Última flag is_extended vista em feed(); usada por tick() para concluir
+        # o teste mesmo quando o fluxo de mensagens para (ex.: replay CSV acabou).
+        self._last_is_extended = True
 
     def start_test(self, test: TestDefinition):
         """Inicia um novo teste: zera os buffers e entra na fase BASELINE.
@@ -855,32 +858,59 @@ class DiscoveryEngine:
         if self.phase not in (Phase.BASELINE, Phase.TESTING):
             return
 
+        # Guarda a última flag de ID estendido — tick() precisa dela para
+        # rodar a análise caso o fluxo de mensagens pare antes do tempo acabar.
+        self._last_is_extended = is_extended
+
+        # feed() apenas GRAVA os dados. As transições de fase e a análise são
+        # feitas por tick() (chamado pelo timer da GUI), garantindo que o teste
+        # SEMPRE conclua por tempo de parede, mesmo se as mensagens pararem
+        # (ex.: o replay do CSV terminou no meio do teste).
+        if self.phase == Phase.BASELINE:
+            for i, b in enumerate(data):
+                self._baseline_stats[(can_id, i)].push(b)
+        elif self.phase == Phase.TESTING:
+            for i, b in enumerate(data):
+                self._test_stats[(can_id, i)].push(b)
+
+    def tick(self):
+        """
+        Avança as fases do teste com base no TEMPO DE PAREDE (wall clock).
+
+        Deve ser chamado periodicamente pela GUI (timer ~10 Hz). Diferente de
+        feed(), NÃO depende da chegada de mensagens — por isso o teste conclui
+        mesmo que o barramento fique em silêncio ou o replay CSV termine antes
+        do tempo previsto. Isso evita o travamento em que a barra fica parada
+        (ex.: 59%) esperando mensagens que nunca chegam.
+
+        Como roda só na thread da GUI (uma única thread), não há corrida com
+        feed() para a transição de fase/análise.
+        """
+        if self.phase not in (Phase.BASELINE, Phase.TESTING):
+            return
+        if self._current_test is None:
+            return
+
         now = time.time()
-        elapsed = now - self._phase_start   # tempo decorrido na fase atual.
+        elapsed = now - self._phase_start
         t = self._current_test
 
         if self.phase == Phase.BASELINE:
-            # Baseline ocupa a primeira metade da barra de progresso (0 → 0.5).
             self.progress = min(0.5, elapsed / t.baseline_sec * 0.5)
-            # Grava o valor de cada byte do payload em seu ByteStats de baseline.
-            for i, b in enumerate(data):
-                self._baseline_stats[(can_id, i)].push(b)
-            # Esgotado o tempo de baseline → muda para TESTING e reinicia o relógio.
             if elapsed >= t.baseline_sec:
                 self.phase = Phase.TESTING
                 self._phase_start = now
 
         elif self.phase == Phase.TESTING:
-            # Teste ocupa de 0.5 a 0.95 da barra (reserva 0.95→1.0 p/ análise).
             self.progress = 0.5 + min(0.45, elapsed / t.test_sec * 0.45)
-            # Grava o valor de cada byte no buffer de teste.
-            for i, b in enumerate(data):
-                self._test_stats[(can_id, i)].push(b)
-            # Esgotado o tempo de teste → analisa imediatamente e conclui.
             if elapsed >= t.test_sec:
                 self.phase = Phase.ANALYZING
                 self.progress = 0.95
-                self.results = self._analyze(is_extended)
+                try:
+                    self.results = self._analyze(self._last_is_extended)
+                except Exception:
+                    # Nunca deixa uma falha de análise travar a UI
+                    self.results = []
                 self.phase = Phase.DONE
                 self.progress = 1.0
 

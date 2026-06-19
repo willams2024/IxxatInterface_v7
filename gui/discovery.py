@@ -580,6 +580,11 @@ class DiscoveryTab(QWidget):
         Ao detectar Phase.DONE, encerra o ciclo: para o timer, restaura botões,
         desliga simulação e exibe os candidatos (_show_results).
         """
+        # Avança as fases por tempo de parede (não depende de mensagens novas).
+        # Sem isto, se o fluxo de mensagens parar (ex.: replay CSV terminou no
+        # meio do teste), a barra ficaria travada esperando dados que não vêm.
+        self._engine.tick()
+
         phase = self._engine.phase
         # Progresso 0–100% derivado de engine.progress (0.0–1.0).
         pct = int(self._engine.progress * 100)
