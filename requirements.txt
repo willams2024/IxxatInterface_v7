@@ -1,0 +1,10 @@
+# Dependências do IxxatInterface v7
+# Instalar com:  pip install -r requirements.txt
+
+python-can>=4.3.0     # acesso ao barramento CAN (backend IXXAT)
+PyQt5>=5.15.0         # interface gráfica
+openpyxl>=3.1.0       # exportação da planilha Excel (formato VIRLOC)
+pyserial>=3.5         # dependência auxiliar do python-can
+
+# Para gerar o executável (.exe):
+#   pip install pyinstaller

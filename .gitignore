@@ -1,0 +1,29 @@
+# ── Artefatos de build do PyInstaller ──────────────────────────────
+build/
+dist/
+*.spec
+
+# ── Executável gerado (muito grande p/ Git — gere localmente) ───────
+*.exe
+
+# ── Cache Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ── Logs gerados em runtime ─────────────────────────────────────────
+Log/
+log_*.txt
+discovery_debug.log
+sessao_*.txt
+
+# ── Ambientes virtuais ──────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── IDE / Sistema ───────────────────────────────────────────────────
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
