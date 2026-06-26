@@ -305,6 +305,10 @@ class CandidateSignal:
     pgn_name: Optional[str] = None   # Acrônimo/nome do PGN (se conhecido).
     spn_name: Optional[str] = None   # Nome do SPN (parâmetro) correspondente.
     confidence: float = 0.0          # Confiança final 0..1 (usada para ranquear).
+    # Forma de onda observada durante o TESTE (valores em engenharia já
+    # convertidos: raw*factor+offset), reamostrada para ~80 pontos. Usada para
+    # desenhar o "gráfico de comportamento observado" no relatório PDF.
+    samples: list = field(default_factory=list)
 
     def describe(self) -> str:
         """Descrição curta e legível do candidato (para UI/depuração).
@@ -951,6 +955,15 @@ class DiscoveryEngine:
         # 4) Lista completa ordenada por confiança (antes de cortar o top 8).
         all_sorted = sorted(seen.values(), key=lambda x: -x.confidence)
 
+        # 4.1) Anexa a FORMA DE ONDA observada (comportamento durante o teste)
+        #      a cada candidato — usada para desenhar o gráfico de linha no
+        #      relatório PDF. Valores já convertidos para engenharia.
+        for c in all_sorted:
+            try:
+                c.samples = self._observed_series(c)
+            except Exception:
+                c.samples = []
+
         # 5) Salva TODOS os candidatos (incluindo descartados) no log de debug.
         try:
             self._write_debug_log(t, all_sorted, top_n=8)
@@ -960,6 +973,32 @@ class DiscoveryEngine:
 
         # 6) Apenas os 8 melhores vão para a tela do usuário.
         return all_sorted[:8]
+
+    def _observed_series(self, c: CandidateSignal, n_points: int = 80) -> list:
+        """
+        Reconstrói a forma de onda observada durante o TESTE para um candidato,
+        já convertida para a grandeza física (raw * factor + offset), e
+        reamostrada para no máximo n_points pontos (mantém o PDF leve).
+
+        Para sinais de 2 bytes, combina os dois bytes na ordem detectada.
+        """
+        if c.length_bytes == 2:
+            if (c.byte_order or 'little') == 'little':
+                raw_series = self._combine_bytes(c.can_id, c.byte_index, c.byte_index + 1)
+            else:
+                raw_series = self._combine_bytes(c.can_id, c.byte_index + 1, c.byte_index)
+            raw_series = raw_series or []
+        else:
+            stats = self._test_stats.get((c.can_id, c.byte_index))
+            raw_series = list(stats.values) if stats else []
+
+        if not raw_series:
+            return []
+
+        # Reamostra para n_points (média de blocos) se a série for grande.
+        resampled = _resample(raw_series, min(n_points, len(raw_series)))
+        # Converte para engenharia usando a fórmula do candidato.
+        return [v * c.formula_factor + c.formula_offset for v in resampled]
 
     @staticmethod
     def _write_debug_log(t: 'TestDefinition',

@@ -1344,8 +1344,8 @@ class SignalsTab(QWidget):
         <h2 style="color: #1a237e; margin-top: 24px;">✗ Sinais Pendentes ({len(unmapped_keys)})</h2>
         {"<table cellpadding='6' cellspacing='0' border='1' bordercolor='#bbb' width='100%' style='border-collapse: collapse; font-size: 11px;'><thead style='background:#666; color:white;'><tr><th>Sinal</th><th>Unidade</th><th>Status</th></tr></thead><tbody>" + rows_unmapped + "</tbody></table>" if unmapped_keys else "<p style='color:#2e7d32;'>Todos os sinais do catálogo foram mapeados! ✓</p>"}
 
-        <!-- GRÁFICOS DE PROBABILIDADE DAS PGNs CHECADAS -->
-        <h2 style="color: #1a237e; margin-top: 24px;">📊 Gráficos — PGNs Checadas e Probabilidade</h2>
+        <!-- GRÁFICOS: COMPORTAMENTO OBSERVADO (LINHA) + PROBABILIDADE (BARRAS) -->
+        <h2 style="color: #1a237e; margin-top: 24px;">📈 Gráficos — Comportamento Observado e Probabilidade</h2>
         <p style="color: #555; font-size: 11px;">
         Para cada sinal testado, o gráfico mostra <b>todas as PGNs/CAN IDs que o algoritmo
         avaliou</b> e a <b>confiança</b> (probabilidade) de cada uma. Barras verdes = alta
@@ -1389,11 +1389,24 @@ class SignalsTab(QWidget):
                 continue
             test = TESTS.get(key)
             nome = test.name if test else key
-            blocks.append(
-                f'<div style="margin-top:10px;">'
+            block = f'<h3 style="color:#1a237e; margin-top:18px; margin-bottom:2px;">{nome}</h3>'
+            # 1º: gráfico de LINHA do comportamento observado (se houver amostras)
+            top = candidates[0]
+            if getattr(top, "samples", None):
+                block += (
+                    '<div style="margin-top:4px;">'
+                    '<span style="color:#555; font-size:11px;">Comportamento observado durante o teste:</span><br>'
+                    f'<img src="behavior_{key}" width="760">'
+                    '</div>'
+                )
+            # 2º: gráfico de barras de probabilidade dos candidatos
+            block += (
+                '<div style="margin-top:6px;">'
+                '<span style="color:#555; font-size:11px;">Probabilidade das PGNs checadas:</span><br>'
                 f'<img src="chart_{key}" width="760">'
-                f'</div>'
+                '</div>'
             )
+            blocks.append(block)
         if not blocks:
             return "<p style='color:#888;'>Nenhuma PGN foi checada nesta sessão.</p>"
         return "".join(blocks)
@@ -1411,9 +1424,18 @@ class SignalsTab(QWidget):
                 continue
             test = TESTS.get(key)
             nome = test.name if test else key
-            img = self._make_candidates_chart(nome, candidates)
+            unit = _SIGNAL_UNIT.get(key, "")
+            # Gráfico de barras de confiança (probabilidade dos candidatos)
+            img_bar = self._make_candidates_chart(nome, candidates)
             doc.addResource(QTextDocument.ImageResource,
-                            QUrl(f"chart_{key}"), img)
+                            QUrl(f"chart_{key}"), img_bar)
+            # Gráfico de LINHA do comportamento observado (forma de onda do
+            # melhor candidato durante o teste). Só registra se houver amostras.
+            top = candidates[0]
+            if getattr(top, "samples", None):
+                img_line = self._make_behavior_chart(nome, top, unit)
+                doc.addResource(QTextDocument.ImageResource,
+                                QUrl(f"behavior_{key}"), img_line)
 
     def _make_candidates_chart(self, nome: str, candidates: list):
         """Desenha um gráfico de barras horizontais da confiança dos candidatos.
@@ -1477,6 +1499,88 @@ class SignalsTab(QWidget):
             p.setFont(QFont("Arial", 9, QFont.Bold))
             p.drawText(QRectF(bar_x + bar_max + 6, y, 60, row_h - 4),
                        _Qt.AlignLeft | _Qt.AlignVCenter, f"{conf * 100:.0f}%")
+
+        p.end()
+        return img
+
+    def _make_behavior_chart(self, nome: str, sig, unit: str):
+        """Desenha um GRÁFICO DE LINHA do comportamento observado do sinal.
+
+        Plota a forma de onda (sig.samples — valores em engenharia capturados
+        durante o teste) ao longo do tempo. Mostra como o sinal de fato variou
+        (ex.: RPM subindo 800→1500→2500→3500). Eixo Y rotulado com mín/máx.
+        Retorna uma QImage pronta para embutir no PDF.
+        """
+        from PyQt5.QtGui import QImage, QPainter, QPen, QFont
+        from PyQt5.QtCore import QRectF, QPointF, Qt as _Qt
+
+        samples = list(sig.samples or [])
+        W, H = 760, 200
+        img = QImage(W, H, QImage.Format_ARGB32)
+        img.fill(QColor("#ffffff"))
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Margens da área de plotagem
+        MX, MY = 70, 30      # esquerda (rótulos Y) / topo (título)
+        MR, MB = 16, 26      # direita / base (eixo X)
+        PW = W - MX - MR
+        PH = H - MY - MB
+
+        # Título
+        id_str = (f"0x{sig.can_id:08X}" if sig.is_extended else f"0x{sig.can_id:04X}")
+        byte_s = (f"B{sig.byte_index}" if sig.length_bytes == 1
+                  else f"B{sig.byte_index}-{sig.byte_index + sig.length_bytes - 1}")
+        titulo = f"{nome}  ·  {id_str} {byte_s}"
+        p.setPen(QColor("#1a237e"))
+        p.setFont(QFont("Arial", 11, QFont.Bold))
+        p.drawText(QRectF(4, 4, W - 8, 20), _Qt.AlignLeft | _Qt.AlignVCenter, titulo)
+
+        # Moldura da área de plotagem
+        p.setPen(QPen(QColor("#cccccc"), 1))
+        p.drawRect(QRectF(MX, MY, PW, PH))
+
+        if len(samples) < 2:
+            p.setPen(QColor("#999999"))
+            p.setFont(QFont("Arial", 10))
+            p.drawText(QRectF(MX, MY, PW, PH), _Qt.AlignCenter,
+                       "Sem amostras suficientes para o gráfico")
+            p.end()
+            return img
+
+        vmin, vmax = min(samples), max(samples)
+        if vmax == vmin:                  # série constante: evita divisão por zero
+            vmax = vmin + 1.0
+        span = vmax - vmin
+
+        # Rótulos do eixo Y (mín, meio, máx) + linhas de grade
+        p.setFont(QFont("Consolas", 8))
+        for frac, val in ((0.0, vmax), (0.5, (vmin + vmax) / 2), (1.0, vmin)):
+            gy = MY + frac * PH
+            p.setPen(QPen(QColor("#eeeeee"), 1))
+            p.drawLine(QPointF(MX, gy), QPointF(MX + PW, gy))
+            p.setPen(QColor("#666666"))
+            lbl = f"{val:.1f}" if span < 100 else f"{val:.0f}"
+            p.drawText(QRectF(2, gy - 8, MX - 6, 16),
+                       _Qt.AlignRight | _Qt.AlignVCenter, lbl)
+
+        # Linha do comportamento observado
+        p.setPen(QPen(QColor("#6c63ff"), 2))
+        n = len(samples)
+        pts = []
+        for i, v in enumerate(samples):
+            x = MX + (i / (n - 1)) * PW
+            y = MY + (1.0 - (v - vmin) / span) * PH
+            pts.append(QPointF(x, y))
+        for i in range(1, len(pts)):
+            p.drawLine(pts[i - 1], pts[i])
+
+        # Eixo X (rótulo de tempo)
+        p.setPen(QColor("#666666"))
+        p.setFont(QFont("Arial", 8))
+        p.drawText(QRectF(MX, MY + PH + 4, PW, 18),
+                   _Qt.AlignRight | _Qt.AlignVCenter,
+                   f"tempo do teste →   (unidade: {unit or 'bruto'})")
 
         p.end()
         return img
