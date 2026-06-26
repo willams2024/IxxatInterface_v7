@@ -1117,6 +1117,9 @@ class SignalsTab(QWidget):
         try:
             html = self._build_report_html(meta)   # monta o HTML completo
             doc = QTextDocument()
+            # Registra os gráficos (QImage) como recursos ANTES de carregar o
+            # HTML, para que as tags <img src="chart_<key>"> sejam resolvidas.
+            self._register_chart_images(doc)
             doc.setHtml(html)                        # carrega o HTML no documento
 
             # Configura o "impressora virtual" para gerar um arquivo PDF A4.
@@ -1341,6 +1344,15 @@ class SignalsTab(QWidget):
         <h2 style="color: #1a237e; margin-top: 24px;">✗ Sinais Pendentes ({len(unmapped_keys)})</h2>
         {"<table cellpadding='6' cellspacing='0' border='1' bordercolor='#bbb' width='100%' style='border-collapse: collapse; font-size: 11px;'><thead style='background:#666; color:white;'><tr><th>Sinal</th><th>Unidade</th><th>Status</th></tr></thead><tbody>" + rows_unmapped + "</tbody></table>" if unmapped_keys else "<p style='color:#2e7d32;'>Todos os sinais do catálogo foram mapeados! ✓</p>"}
 
+        <!-- GRÁFICOS DE PROBABILIDADE DAS PGNs CHECADAS -->
+        <h2 style="color: #1a237e; margin-top: 24px;">📊 Gráficos — PGNs Checadas e Probabilidade</h2>
+        <p style="color: #555; font-size: 11px;">
+        Para cada sinal testado, o gráfico mostra <b>todas as PGNs/CAN IDs que o algoritmo
+        avaliou</b> e a <b>confiança</b> (probabilidade) de cada uma. Barras verdes = alta
+        probabilidade; laranja = média; vermelha = baixa.
+        </p>
+        {self._build_charts_html()}
+
         <!-- CANDIDATOS ALTERNATIVOS (PGNs menos prováveis) -->
         <h2 style="color: #1a237e; margin-top: 24px;">🔍 Candidatos Alternativos (PGNs menos prováveis)</h2>
         <p style="color: #555; font-size: 11px;">
@@ -1361,6 +1373,113 @@ class SignalsTab(QWidget):
         </body></html>
         """
         return html
+
+    def _build_charts_html(self) -> str:
+        """Monta a seção de gráficos (um <img> por sinal testado).
+
+        Cada imagem é resolvida em tempo de impressão a partir dos recursos
+        registrados em _register_chart_images(doc). Aqui só emitimos as tags
+        <img src="chart_<key>"> na ordem dos sinais com candidatos.
+        """
+        if not self._all_candidates:
+            return "<p style='color:#888;'>Nenhuma PGN foi checada nesta sessão.</p>"
+        blocks = []
+        for key, candidates in self._all_candidates.items():
+            if not candidates:
+                continue
+            test = TESTS.get(key)
+            nome = test.name if test else key
+            blocks.append(
+                f'<div style="margin-top:10px;">'
+                f'<img src="chart_{key}" width="760">'
+                f'</div>'
+            )
+        if not blocks:
+            return "<p style='color:#888;'>Nenhuma PGN foi checada nesta sessão.</p>"
+        return "".join(blocks)
+
+    def _register_chart_images(self, doc):
+        """Desenha e registra no QTextDocument um gráfico por sinal testado.
+
+        Cada gráfico é uma QImage (barras de confiança dos candidatos) registrada
+        como recurso de imagem do documento, referenciada no HTML por
+        'chart_<key>'. Deve ser chamado ANTES de doc.print_().
+        """
+        from PyQt5.QtCore import QUrl
+        for key, candidates in self._all_candidates.items():
+            if not candidates:
+                continue
+            test = TESTS.get(key)
+            nome = test.name if test else key
+            img = self._make_candidates_chart(nome, candidates)
+            doc.addResource(QTextDocument.ImageResource,
+                            QUrl(f"chart_{key}"), img)
+
+    def _make_candidates_chart(self, nome: str, candidates: list):
+        """Desenha um gráfico de barras horizontais da confiança dos candidatos.
+
+        Cada barra = um candidato (PGN/CAN ID + byte). O comprimento da barra é
+        proporcional à confiança (0–100%). Cor por faixa: verde >80%, laranja
+        50–80%, vermelho <50%. Retorna uma QImage pronta para embutir no PDF.
+        """
+        from PyQt5.QtGui import QImage, QPainter, QPen, QFont
+        from PyQt5.QtCore import QRectF, Qt as _Qt
+
+        n = min(len(candidates), 8)        # no máximo 8 barras por gráfico
+        row_h  = 28                         # altura de cada linha/barra
+        top    = 34                         # espaço do título no topo
+        W      = 760
+        H      = top + n * row_h + 14
+        label_w = 250                       # largura reservada ao rótulo (PGN/ID)
+        bar_x   = label_w + 10
+        bar_max = W - bar_x - 70            # largura máxima da barra (sobra p/ %)
+
+        img = QImage(W, H, QImage.Format_ARGB32)
+        img.fill(QColor("#ffffff"))
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Título do gráfico (nome do sinal testado)
+        p.setPen(QColor("#1a237e"))
+        p.setFont(QFont("Arial", 11, QFont.Bold))
+        p.drawText(QRectF(4, 6, W - 8, 22), _Qt.AlignLeft | _Qt.AlignVCenter, nome)
+
+        for i, sig in enumerate(candidates[:n]):
+            y = top + i * row_h
+            conf = max(0.0, min(1.0, sig.confidence))
+
+            # Rótulo: PGN/sigla + CAN ID + byte
+            id_str = (f"0x{sig.can_id:08X}" if sig.is_extended
+                      else f"0x{sig.can_id:04X}")
+            byte_s = (f"B{sig.byte_index}" if sig.length_bytes == 1
+                      else f"B{sig.byte_index}-{sig.byte_index + sig.length_bytes - 1}")
+            pgn_lbl = sig.pgn_name or (str(sig.pgn) if sig.pgn else id_str)
+            label = f"{pgn_lbl}  {id_str} {byte_s}"
+            p.setPen(QColor("#333333"))
+            p.setFont(QFont("Consolas", 8))
+            p.drawText(QRectF(4, y, label_w, row_h - 4),
+                       _Qt.AlignLeft | _Qt.AlignVCenter, label)
+
+            # Trilho de fundo da barra
+            p.fillRect(QRectF(bar_x, y + 5, bar_max, row_h - 14), QColor("#eeeeee"))
+            # Cor por faixa de confiança
+            if conf > 0.80:
+                color = QColor("#2e7d32")    # verde — alta
+            elif conf > 0.50:
+                color = QColor("#f57c00")    # laranja — média
+            else:
+                color = QColor("#c62828")    # vermelho — baixa
+            # Barra preenchida proporcional à confiança
+            p.fillRect(QRectF(bar_x, y + 5, bar_max * conf, row_h - 14), color)
+
+            # Texto da porcentagem ao lado da barra
+            p.setPen(QColor("#000000"))
+            p.setFont(QFont("Arial", 9, QFont.Bold))
+            p.drawText(QRectF(bar_x + bar_max + 6, y, 60, row_h - 4),
+                       _Qt.AlignLeft | _Qt.AlignVCenter, f"{conf * 100:.0f}%")
+
+        p.end()
+        return img
 
     def _build_alternatives_html(self) -> str:
         """Monta a seção de candidatos alternativos do relatório PDF.
