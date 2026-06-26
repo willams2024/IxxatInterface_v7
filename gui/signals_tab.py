@@ -1372,6 +1372,18 @@ class SignalsTab(QWidget):
         </p>
         </body></html>
         """
+        # ── Correção crítica de renderização em PDF ───────────────────────────
+        # O QTextDocument impresso em QPrinter de ALTA RESOLUÇÃO interpreta
+        # 'px' na DPI da impressora (~1200), fazendo fontes em px ficarem
+        # minúsculas/invisíveis. Convertemos todos os 'font-size: Npx' do
+        # relatório para 'pt' (unidade física), que escala corretamente no PDF.
+        # Fator ~0.72: 11px→8pt, 10px→7pt, 12px→9pt, 16px→12pt.
+        import re
+        html = re.sub(
+            r'font-size:\s*(\d+)px',
+            lambda m: f'font-size: {max(7, round(int(m.group(1)) * 0.72))}pt',
+            html,
+        )
         return html
 
     def _build_charts_html(self) -> str:
@@ -1390,22 +1402,32 @@ class SignalsTab(QWidget):
             test = TESTS.get(key)
             nome = test.name if test else key
             block = f'<h3 style="color:#1a237e; margin-top:18px; margin-bottom:2px;">{nome}</h3>'
-            # 1º: gráfico de LINHA do comportamento observado (se houver amostras)
-            top = candidates[0]
-            if getattr(top, "samples", None):
-                block += (
-                    '<div style="margin-top:4px;">'
-                    '<span style="color:#555; font-size:11px;">Comportamento observado durante o teste:</span><br>'
-                    f'<img src="behavior_{key}" width="760">'
-                    '</div>'
-                )
-            # 2º: gráfico de barras de probabilidade dos candidatos
+            # 1º: gráfico de barras de probabilidade dos candidatos (visão geral)
             block += (
                 '<div style="margin-top:6px;">'
                 '<span style="color:#555; font-size:11px;">Probabilidade das PGNs checadas:</span><br>'
                 f'<img src="chart_{key}" width="760">'
                 '</div>'
             )
+            # 2º: comportamento observado de CADA candidato (um gráfico de linha
+            # por candidato), para comparar a forma de onda e validar visualmente.
+            line_imgs = ""
+            for i, cand in enumerate(candidates[:8]):
+                if getattr(cand, "samples", None):
+                    line_imgs += (
+                        f'<div style="margin-top:6px;">'
+                        f'<img src="behavior_{key}_{i}" width="760">'
+                        f'</div>'
+                    )
+            if line_imgs:
+                block += (
+                    '<div style="margin-top:8px;">'
+                    '<span style="color:#555; font-size:11px;">'
+                    'Comportamento observado de cada candidato (compare a forma de onda):'
+                    '</span>'
+                    + line_imgs +
+                    '</div>'
+                )
             blocks.append(block)
         if not blocks:
             return "<p style='color:#888;'>Nenhuma PGN foi checada nesta sessão.</p>"
@@ -1429,13 +1451,15 @@ class SignalsTab(QWidget):
             img_bar = self._make_candidates_chart(nome, candidates)
             doc.addResource(QTextDocument.ImageResource,
                             QUrl(f"chart_{key}"), img_bar)
-            # Gráfico de LINHA do comportamento observado (forma de onda do
-            # melhor candidato durante o teste). Só registra se houver amostras.
-            top = candidates[0]
-            if getattr(top, "samples", None):
-                img_line = self._make_behavior_chart(nome, top, unit)
-                doc.addResource(QTextDocument.ImageResource,
-                                QUrl(f"behavior_{key}"), img_line)
+            # Gráfico de LINHA do comportamento observado para CADA candidato
+            # (até 8). Permite comparar visualmente a forma de onda de todos os
+            # bytes/PGNs avaliados e escolher o que melhor casa com a ação.
+            for i, cand in enumerate(candidates[:8]):
+                if getattr(cand, "samples", None):
+                    img_line = self._make_behavior_chart(nome, cand, unit,
+                                                         rank=i + 1)
+                    doc.addResource(QTextDocument.ImageResource,
+                                    QUrl(f"behavior_{key}_{i}"), img_line)
 
     def _make_candidates_chart(self, nome: str, candidates: list):
         """Desenha um gráfico de barras horizontais da confiança dos candidatos.
@@ -1503,38 +1527,51 @@ class SignalsTab(QWidget):
         p.end()
         return img
 
-    def _make_behavior_chart(self, nome: str, sig, unit: str):
+    def _make_behavior_chart(self, nome: str, sig, unit: str, rank: int = 0):
         """Desenha um GRÁFICO DE LINHA do comportamento observado do sinal.
 
         Plota a forma de onda (sig.samples — valores em engenharia capturados
         durante o teste) ao longo do tempo. Mostra como o sinal de fato variou
         (ex.: RPM subindo 800→1500→2500→3500). Eixo Y rotulado com mín/máx.
+
+        rank: posição do candidato no ranking (1 = melhor). 0 = não exibe rank.
         Retorna uma QImage pronta para embutir no PDF.
         """
         from PyQt5.QtGui import QImage, QPainter, QPen, QFont
         from PyQt5.QtCore import QRectF, QPointF, Qt as _Qt
 
         samples = list(sig.samples or [])
-        W, H = 760, 200
+        W, H = 760, 160
         img = QImage(W, H, QImage.Format_ARGB32)
         img.fill(QColor("#ffffff"))
         p = QPainter(img)
         p.setRenderHint(QPainter.Antialiasing)
 
         # Margens da área de plotagem
-        MX, MY = 70, 30      # esquerda (rótulos Y) / topo (título)
-        MR, MB = 16, 26      # direita / base (eixo X)
+        MX, MY = 70, 28      # esquerda (rótulos Y) / topo (título)
+        MR, MB = 16, 24      # direita / base (eixo X)
         PW = W - MX - MR
         PH = H - MY - MB
 
-        # Título
+        # Cor da linha por faixa de confiança (igual ao gráfico de barras)
+        conf = max(0.0, min(1.0, sig.confidence))
+        if conf > 0.80:
+            line_color = QColor("#2e7d32")      # verde — alta
+        elif conf > 0.50:
+            line_color = QColor("#f57c00")      # laranja — média
+        else:
+            line_color = QColor("#c62828")      # vermelho — baixa
+
+        # Título: rank + PGN/CAN ID + byte + confiança
         id_str = (f"0x{sig.can_id:08X}" if sig.is_extended else f"0x{sig.can_id:04X}")
         byte_s = (f"B{sig.byte_index}" if sig.length_bytes == 1
                   else f"B{sig.byte_index}-{sig.byte_index + sig.length_bytes - 1}")
-        titulo = f"{nome}  ·  {id_str} {byte_s}"
+        pgn_lbl = sig.pgn_name or (str(sig.pgn) if sig.pgn else "")
+        rank_lbl = f"#{rank}  " if rank else ""
+        titulo = f"{rank_lbl}{pgn_lbl}  {id_str} {byte_s}  —  {conf*100:.0f}% confiança"
         p.setPen(QColor("#1a237e"))
-        p.setFont(QFont("Arial", 11, QFont.Bold))
-        p.drawText(QRectF(4, 4, W - 8, 20), _Qt.AlignLeft | _Qt.AlignVCenter, titulo)
+        p.setFont(QFont("Arial", 10, QFont.Bold))
+        p.drawText(QRectF(4, 4, W - 8, 18), _Qt.AlignLeft | _Qt.AlignVCenter, titulo)
 
         # Moldura da área de plotagem
         p.setPen(QPen(QColor("#cccccc"), 1))
@@ -1564,8 +1601,8 @@ class SignalsTab(QWidget):
             p.drawText(QRectF(2, gy - 8, MX - 6, 16),
                        _Qt.AlignRight | _Qt.AlignVCenter, lbl)
 
-        # Linha do comportamento observado
-        p.setPen(QPen(QColor("#6c63ff"), 2))
+        # Linha do comportamento observado (cor conforme a confiança)
+        p.setPen(QPen(line_color, 2))
         n = len(samples)
         pts = []
         for i, v in enumerate(samples):
