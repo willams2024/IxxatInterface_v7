@@ -100,6 +100,86 @@ PID_DATABASE: dict[int, PID] = {
 }
 
 
+# ── Fórmulas em TEXTO (para documentação/exportação) ────────────────────────
+# As lambdas do PID_DATABASE não podem ser lidas como texto, então mantemos
+# aqui a mesma conta em notação da norma (A = 1º byte de dados, B = 2º).
+# Se uma fórmula do banco mudar, atualize também a descrição correspondente.
+FORMULA_TXT: dict[int, str] = {
+    0x04: "A × 100 / 255",
+    0x05: "A − 40",
+    0x06: "A × 100 / 128 − 100",
+    0x07: "A × 100 / 128 − 100",
+    0x0A: "A × 3",
+    0x0B: "A",
+    0x0C: "(A × 256 + B) / 4",
+    0x0D: "A",
+    0x0E: "A / 2 − 64",
+    0x0F: "A − 40",
+    0x10: "(A × 256 + B) / 100",
+    0x11: "A × 100 / 255",
+    0x1F: "A × 256 + B",
+    0x21: "A × 256 + B",
+    0x2F: "A × 100 / 255",
+    0x31: "A × 256 + B",
+    0x33: "A",
+    0x42: "(A × 256 + B) / 1000",
+    0x46: "A − 40",
+    0x5C: "A − 40",
+    0x5E: "(A × 256 + B) / 20",
+}
+
+
+def formula_text(pid: int) -> str:
+    """Fórmula de conversão do PID em texto legível (ou '—' se desconhecida)."""
+    return FORMULA_TXT.get(pid, "—")
+
+
+# ── Notas de referência do protocolo (usadas na documentação exportada) ─────
+# Pares (tópico, explicação) que descrevem como o diálogo OBD-II acontece no
+# barramento. Ficam aqui, junto do codec, para que a exportação da GUI seja
+# apenas formatação — sem regra de protocolo duplicada na interface.
+PROTOCOL_NOTES: list[tuple[str, str]] = [
+    ("Norma",
+     "SAE J1979 (PIDs de diagnóstico) transportado por ISO 15765-2/4 "
+     "(ISO-TP) sobre CAN. Neste programa tratamos o MODO 01 — leitura de "
+     "dados atuais."),
+    ("Camada física",
+     "CAN 11 bits (identificador padrão). Na maioria dos veículos leves a "
+     "taxa é 500 kbps; alguns usam 250 kbps."),
+    ("Request funcional",
+     f"ID 0x{OBD_REQUEST_FUNCTIONAL:03X} — a pergunta chega a TODAS as ECUs "
+     "compatíveis. Cada módulo que conhece o PID responde na sua própria ID "
+     "física, então o mesmo PID pode voltar com valores diferentes."),
+    ("Request físico",
+     f"ID 0x{OBD_REQUEST_PHYSICAL_BASE:03X}+n (n = 0..7) — endereça um único "
+     "módulo, eliminando a ambiguidade de várias respostas."),
+    ("Respostas",
+     f"IDs 0x{OBD_RESP_MIN:03X}..0x{OBD_RESP_MAX:03X}. A ECU endereçada por "
+     f"0x{OBD_REQUEST_PHYSICAL_BASE:03X}+n responde em "
+     f"0x{OBD_RESP_MIN:03X}+n."),
+    ("Quadro de request",
+     "[0x02, 0x01, PID, padding...] — 0x02 é o comprimento útil em bytes "
+     "(modo + PID), 0x01 é o modo (dados atuais) e o resto do quadro é "
+     "preenchimento (0x55)."),
+    ("Quadro de resposta",
+     "[len, 0x41, PID, A, B, C, D] — 0x41 = 0x01 (modo) + 0x40 (bit de "
+     "resposta positiva); A, B, C, D são os bytes de dados usados pela "
+     "fórmula do PID."),
+    ("Single Frame (SF)",
+     "O nibble alto do 1º byte identifica o tipo de quadro ISO-TP; 0 = Single "
+     "Frame. Este programa só decodifica Single Frame — respostas multi-frame "
+     "(VIN, lista de DTCs) exigiriam Flow Control e são ignoradas."),
+    ("Resposta negativa",
+     "Quando a ECU não suporta o PID ela responde 0x7F (serviço não "
+     "suportado) ou simplesmente não responde. PIDs sem resposta aparecem na "
+     "seção 'PIDs sem resposta' desta documentação."),
+    ("Impacto no barramento",
+     "Esta é a ÚNICA função do programa que transmite no barramento: um "
+     "quadro de request por PID consultado. Nenhum dado é escrito nas ECUs "
+     "(modo 01 é somente leitura) e nenhuma rotina de atuação/teste é usada."),
+]
+
+
 def build_request(pid: int, target_ecu: Optional[int] = None) -> tuple[int, bytes]:
     """
     Monta o quadro de REQUEST OBD-II modo 01 para um PID.

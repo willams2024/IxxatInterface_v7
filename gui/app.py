@@ -679,6 +679,7 @@ class MainWindow(QMainWindow):
             "  • Detecção automática de sinais 1-byte e 2-byte (LE/BE)\n"
             "  • Suporte a CAN 11-bit proprietário e 29-bit J1939\n"
             "  • Leitura de PIDs OBD-II (SAE J1979, modo 01) com stream contínuo\n"
+            "  • Documentação do protocolo OBD-II observado (Excel/TXT)\n"
             "  • Calibração de 2 pontos para sinais proprietários\n"
             "  • Exportação Excel formato VIRLOC + Relatório PDF\n"
             "  • Replay de logs CSV da IXXAT miniMon\n"

@@ -105,6 +105,10 @@ class CANBus:
         self._replay_messages: list   = []   # mantido em memória para reinício rápido
         # Modo listen-only atual (passivo). Relevante para OBD-II, que exige TX.
         self._listen_only = True
+        # Parâmetros da última conexão — guardados só para documentação
+        # (relatórios/exportações precisam registrar canal e baudrate usados).
+        self._channel = 0
+        self._bitrate = 0
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -146,6 +150,10 @@ class CANBus:
         # requests, o que é impossível em listen-only — a aba OBD2 usa este
         # estado para avisar o usuário.
         self._listen_only = listen_only
+        # Registra canal/baudrate desta conexão (usados nas documentações
+        # exportadas, que precisam dizer em que barramento a captura foi feita).
+        self._channel = channel
+        self._bitrate = bitrate
 
         # Caminho 1: modo simulação — nenhum hardware é tocado. Dispara a
         # thread _sim_loop que gera mensagens J1939 sintéticas.
@@ -569,6 +577,16 @@ class CANBus:
     def is_simulation(self) -> bool:
         """True quando a fonte NÃO é hardware real (simulação ou replay de CSV)."""
         return self._simulation
+
+    @property
+    def channel(self) -> int:
+        """Canal físico da última conexão (informativo, para documentação)."""
+        return self._channel
+
+    @property
+    def bitrate(self) -> int:
+        """Baudrate da última conexão em bits/s (informativo, para documentação)."""
+        return self._bitrate
 
     def add_listener(self, fn: Callable[[CANMessage], None]):
         """Registra um callback que receberá cada CANMessage despachada."""
