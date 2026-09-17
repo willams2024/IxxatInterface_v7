@@ -35,6 +35,7 @@ from core.can_bus import CANBus, CANMessage   # camada de acesso ao barramento C
 from gui.monitor import MonitorTab            # aba "Monitor CAN" (tráfego em tempo real)
 from gui.discovery import DiscoveryTab        # aba "Descoberta de Sinais"
 from gui.signals_tab import SignalsTab        # aba "Sinais Mapeados"
+from gui.obd2_tab import OBD2Tab              # aba "OBD-II" (leitura de PIDs)
 from gui.styles import COLORS, DARK_STYLE     # paleta de cores e folha de estilo escura
 
 
@@ -569,7 +570,13 @@ class MainWindow(QMainWindow):
         self._signals_tab.set_bus(self._bus)
         self._tabs.addTab(self._signals_tab, "📋  Sinais Mapeados")
 
-        # Aba 4 — Banco J1939 (tabela estática) e Aba 5 — Sobre (texto informativo).
+        # Aba 4 — OBD-II: leitura ATIVA de PIDs (pergunta/resposta). Diferente
+        # das demais abas, esta TRANSMITE requests, então exige listen-only OFF.
+        self._obd2_tab = OBD2Tab()
+        self._obd2_tab.set_bus(self._bus)
+        self._tabs.addTab(self._obd2_tab, "🔌  OBD-II")
+
+        # Aba 5 — Banco J1939 (tabela estática) e Aba 6 — Sobre (texto informativo).
         self._tabs.addTab(self._build_pgn_tab(), "📖  Banco J1939")
         self._tabs.addTab(self._build_about_tab(), "ℹ️  Sobre")
 
@@ -654,19 +661,25 @@ class MainWindow(QMainWindow):
 
         info = QLabel(
             "Ferramenta de monitoramento e mapeamento de sinais CAN via IXXAT USB-to-CAN V2.\n\n"
-            "🔒  MODO LISTEN-ONLY ATIVO\n"
-            "Este programa opera em modo 100% passivo — o controlador IXXAT\n"
-            "é configurado com CAN_OPMODE_LISTONLY, o que significa que:\n"
+            "🔒  MODO LISTEN-ONLY (padrão)\n"
+            "Com a caixa 'Listen-Only' marcada, o controlador IXXAT é aberto com\n"
+            "CAN_OPMODE_LISTONLY e opera 100% passivo:\n"
             "  • Nunca transmite mensagens no barramento\n"
-            "  • Não envia ACK frames\n"
-            "  • Não envia error frames\n"
+            "  • Não envia ACK frames nem error frames\n"
             "  • Apenas escuta o tráfego existente\n"
             "  • Seguro para conectar em veículos em operação\n\n"
+            "🔌  EXCEÇÃO — ABA OBD-II\n"
+            "O OBD-II é um protocolo de pergunta/resposta: a ECU só responde se\n"
+            "receber um request. Por isso, APENAS a aba OBD-II transmite, e ela\n"
+            "exige que o Listen-Only esteja DESMARCADO. As demais abas (Monitor,\n"
+            "Descoberta) continuam totalmente passivas.\n\n"
             "Funcionalidades:\n"
             "  • Monitor CAN em tempo real com decodificação J1939 FMS v05\n"
             "  • Descoberta guiada de 22 sinais (RPM, velocidade, freio, etc.)\n"
             "  • Detecção automática de sinais 1-byte e 2-byte (LE/BE)\n"
             "  • Suporte a CAN 11-bit proprietário e 29-bit J1939\n"
+            "  • Leitura de PIDs OBD-II (SAE J1979, modo 01) com stream contínuo\n"
+            "  • Calibração de 2 pontos para sinais proprietários\n"
             "  • Exportação Excel formato VIRLOC + Relatório PDF\n"
             "  • Replay de logs CSV da IXXAT miniMon\n"
             "  • Banco de dados J1939 com ~220 SPNs\n"
@@ -751,6 +764,9 @@ class MainWindow(QMainWindow):
         """
         self._monitor_tab.on_message(msg)
         self._discovery_tab.on_message(msg)
+        # A aba OBD-II filtra apenas as respostas 0x7E8..0x7EF e as enfileira
+        # para a thread da GUI processar (ver OBD2Tab.on_message).
+        self._obd2_tab.on_message(msg)
 
     @pyqtSlot(int)
     def _on_tab_changed(self, idx: int):

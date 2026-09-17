@@ -103,6 +103,8 @@ class CANBus:
         self._replay_paused  = True   # inicia pausado para o usuário ter tempo de configurar
         self._replay_speed   = 1.0    # pode ser alterado durante o replay
         self._replay_messages: list   = []   # mantido em memória para reinício rápido
+        # Modo listen-only atual (passivo). Relevante para OBD-II, que exige TX.
+        self._listen_only = True
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -140,6 +142,10 @@ class CANBus:
         # Caímos em simulação se o usuário pediu explicitamente OU se o
         # python-can não está disponível na máquina (sem driver/hardware).
         self._simulation = simulation or not CAN_AVAILABLE
+        # Guarda o modo listen-only atual. A leitura OBD-II precisa TRANSMITIR
+        # requests, o que é impossível em listen-only — a aba OBD2 usa este
+        # estado para avisar o usuário.
+        self._listen_only = listen_only
 
         # Caminho 1: modo simulação — nenhum hardware é tocado. Dispara a
         # thread _sim_loop que gera mensagens J1939 sintéticas.
@@ -209,6 +215,88 @@ class CANBus:
             # python-can/backend IXXAT ausente (ex.: máquina de dev). Ignora
             # silenciosamente — só faz sentido em modo simulação mesmo.
             pass
+
+    @property
+    def is_listen_only(self) -> bool:
+        """True se a conexão atual está em modo passivo (não transmite)."""
+        return self._listen_only
+
+    def send(self, can_id: int, data: bytes, is_extended: bool = False) -> tuple[bool, str]:
+        """
+        Transmite um quadro CAN no barramento.
+
+        Usado pela leitura OBD-II (que é pergunta/resposta: precisa ENVIAR o
+        request para a ECU responder). NÃO funciona em modo listen-only, pois o
+        controlador está configurado como 100% passivo.
+
+        Em modo SIMULAÇÃO, gera uma resposta OBD-II sintética e a injeta de volta
+        nos listeners, permitindo testar a aba OBD2 sem hardware.
+
+        Retorna (sucesso, mensagem).
+        """
+        if not self._running:
+            return False, "Não conectado ao barramento."
+
+        # Simulação: fabrica uma resposta OBD-II fake para o request enviado.
+        if self._simulation:
+            self._sim_obd2_response(can_id, bytes(data), is_extended)
+            return True, "ok (simulação)"
+
+        # Hardware real: precisa NÃO estar em listen-only.
+        if self._listen_only:
+            return False, ("Transmissão bloqueada: modo Listen-Only ativo.\n"
+                           "Reconecte com 'Listen-Only' DESMARCADO para usar OBD-II.")
+        if self._bus is None:
+            return False, "Barramento não inicializado."
+        try:
+            msg = can.Message(arbitration_id=can_id, data=bytes(data),
+                              is_extended_id=is_extended)
+            self._bus.send(msg)
+            return True, "ok"
+        except Exception as e:
+            return False, str(e)
+
+    def _sim_obd2_response(self, req_id: int, data: bytes, is_extended: bool):
+        """
+        Gera uma resposta OBD-II simulada para um request recebido em send().
+
+        Reconhece requests modo 01 (single frame ISO-TP: [0x02, 0x01, PID, ...])
+        e responde na ID 0x7E8 com valores plausíveis derivados do estado atual
+        do simulador (_SimState). Assim a aba OBD2 funciona em modo simulação.
+        """
+        # Só tratamos requests OBD-II funcionais (0x7DF) ou físicos (0x7E0-0x7E7).
+        if not (req_id == 0x7DF or 0x7E0 <= req_id <= 0x7E7):
+            return
+        if len(data) < 3 or data[1] != 0x01:
+            return
+        pid = data[2]
+        s = self._sim_state
+        # Monta os bytes de dados (A, B, ...) conforme o PID solicitado.
+        payload = None
+        if pid == 0x0C:      # RPM = (256A+B)/4  →  A,B
+            raw = int(max(0, s._rpm) * 4)
+            payload = [(raw >> 8) & 0xFF, raw & 0xFF]
+        elif pid == 0x0D:    # Velocidade = A km/h
+            payload = [int(max(0, min(255, s._speed)))]
+        elif pid == 0x05:    # Temp. arrefecimento = A-40
+            payload = [int(max(0, min(255, s._coolant_temp + 40)))]
+        elif pid == 0x11:    # Borboleta = A*100/255
+            payload = [int(max(0, min(255, s._throttle * 255 / 100)))]
+        elif pid == 0x0F:    # Temp. ar admissão = A-40
+            payload = [int(30 + 40)]
+        elif pid == 0x2F:    # Nível combustível = A*100/255
+            payload = [int(75 * 255 / 100)]
+        elif pid == 0x42:    # Tensão módulo = (256A+B)/1000
+            mv = 13800
+            payload = [(mv >> 8) & 0xFF, mv & 0xFF]
+        elif pid == 0x00:    # PIDs suportados 01-20 (bitmap) — devolve alguns
+            payload = [0x18, 0x3B, 0x80, 0x13]
+        if payload is None:
+            return
+        resp = [len(payload) + 2, 0x41, pid] + payload
+        resp += [0x00] * (8 - len(resp))   # padding para 8 bytes
+        msg = CANMessage(time.time(), 0x7E8, bytes(resp[:8]), False, 8)
+        self._dispatch(msg)
 
     def disconnect(self):
         """
