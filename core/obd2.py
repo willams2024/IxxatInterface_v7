@@ -94,9 +94,16 @@ PID_DATABASE: dict[int, PID] = {
     0x31: PID(0x31, "Distância desde Códigos Limpos", 2, "km", lambda d: d[0] * 256 + d[1], 0, 65535),
     0x33: PID(0x33, "Pressão Barométrica",          1, "kPa",  lambda d: d[0], 0, 255),
     0x42: PID(0x42, "Tensão do Módulo de Controle", 2, "V",    lambda d: (d[0] * 256 + d[1]) / 1000, 0, 65),
+    0x45: PID(0x45, "Posição Relativa da Borboleta", 1, "%",   lambda d: d[0] * 100 / 255, 0, 100),
     0x46: PID(0x46, "Temp. Ambiente",               1, "°C",   lambda d: d[0] - 40, -40, 215),
+    0x49: PID(0x49, "Pedal do Acelerador (pos. D)", 1, "%",    lambda d: d[0] * 100 / 255, 0, 100),
     0x5C: PID(0x5C, "Temp. Óleo do Motor",          1, "°C",   lambda d: d[0] - 40, -40, 215),
     0x5E: PID(0x5E, "Taxa de Consumo de Combustível", 2, "L/h", lambda d: (d[0] * 256 + d[1]) / 20, 0, 3277),
+    # Odômetro (J1979-DA): 4 bytes, resolução 0,1 km. É o PID usado pela
+    # biblioteca de referência do VIRLOC para hodômetro (PID 166 decimal).
+    0xA6: PID(0xA6, "Odômetro",                     4, "km",
+              lambda d: (d[0] * 16777216 + d[1] * 65536 + d[2] * 256 + d[3]) / 10,
+              0, 429496729),
 }
 
 
@@ -123,9 +130,12 @@ FORMULA_TXT: dict[int, str] = {
     0x31: "A × 256 + B",
     0x33: "A",
     0x42: "(A × 256 + B) / 1000",
+    0x45: "A × 100 / 255",
     0x46: "A − 40",
+    0x49: "A × 100 / 255",
     0x5C: "A − 40",
     0x5E: "(A × 256 + B) / 20",
+    0xA6: "(A × 2²⁴ + B × 2¹⁶ + C × 256 + D) / 10",
 }
 
 
@@ -249,3 +259,207 @@ def parse_response(can_id: int, data: bytes) -> Optional[dict]:
     # diferentes para o mesmo PID seriam indistinguíveis.
     return {"src": can_id, "pid": pid, "value": value,
             "unit": info.unit, "name": info.name}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  BIBLIOTECA CAN (VIRLOC) — geração das linhas de configuração do equipamento
+# ════════════════════════════════════════════════════════════════════════════
+#
+# O equipamento de telemetria (VIRLOC) é configurado por linhas de texto no
+# formato >COMANDO,parâmetros<. Para OBD-II a biblioteca tem quatro blocos:
+#
+#   1) >VS19_ENAbbbb,1<   habilita a CAN na taxa bbbb (em kbps) em modo normal
+#                         (modo normal é obrigatório: o OBD-II precisa
+#                         transmitir os requests).
+#   2) >VOBD_ENA1,nnn<    habilita a consulta automática de PIDs.
+#      >VOBDppp,2<        um por PID consultado (ppp = PID em DECIMAL).
+#   3) >VSRMxx,...< / >VSRTnn,MODELO.0<   registros de identificação.
+#   4) >VS19ff,...<       um filtro por sinal, dizendo de onde extrair o valor
+#      >VS19ff_MAT,ops<   as operações inteiras que convertem o valor bruto.
+#
+# O layout do filtro VS na variante OBD-II é
+#     >VS19ff, iiiii, ppp, 11, cc, 4, n, mmmmmmmm, 0, 3<
+# e cada campo está descrito em VS_FIELD_DOC (logo abaixo). Essa descrição é
+# DADO, e não comentário, porque também é impressa na documentação exportada.
+
+VS_FIELD_DOC: list[tuple[str, str]] = [
+    ("VS19ff",   "número do filtro: 00..24 → VS1900..VS1924"),
+    ("iiiii",    "ID CAN da RESPOSTA, em decimal com 5 dígitos "
+                 "(0x7E8 = 02024)"),
+    ("ppp",      "PID consultado, em DECIMAL (0x0C = 12)"),
+    ("11",       "tamanho do identificador: o OBD-II usa ID padrão de 11 bits"),
+    ("cc",       "CT — canal de destino do valor no equipamento (01..96)"),
+    ("4",        "byte inicial, 1-indexado: na resposta "
+                 "[len, 0x41, PID, A, B, C, D] o byte A é sempre o 4º"),
+    ("n",        "quantos bytes ler (tamanho do dado do PID)"),
+    ("mmmmmmmm", "máscara de bits: n bytes de FF "
+                 "(1 byte = 000000FF, 2 bytes = 0000FFFF)"),
+    ("0",        "modo: 0 = copia o valor (1 acumularia a cada leitura)"),
+    ("3",        "ordem de bytes do OBD-II — dado big-endian, byte A primeiro"),
+]
+
+# Canal (CT) de destino usual de cada PID na biblioteca de referência. Só os
+# quatro abaixo são conhecidos; qualquer outro PID recebe um CT sequencial a
+# partir de CT_FALLBACK_BASE, que deve ser confirmado no equipamento.
+VIRLOC_CT: dict[int, int] = {
+    0x0C: 11,   # rotação do motor (RPM)
+    0x0D: 10,   # velocidade do veículo
+    0xA6: 13,   # hodômetro
+    0x45: 4,    # % de pedal do acelerador
+}
+CT_FALLBACK_BASE = 20      # 1º CT sugerido para PIDs sem canal documentado
+CT_MAX = 96                # maior CT aceito pelo equipamento
+LIB_MAX_FILTERS = 25       # VS1900..VS1924 — limite de filtros do equipamento
+
+# Operações MAT (matemática inteira do equipamento) equivalentes à fórmula de
+# cada PID. O equipamento não tem ponto flutuante: só sabe multiplicar, dividir
+# e somar inteiros, aplicados da ESQUERDA para a DIREITA, sem precedência.
+# Lista vazia = o valor bruto já é o valor final (nenhuma linha MAT é gerada).
+MAT_OPS: dict[int, list[str]] = {
+    0x04: ["x100/255"],
+    0x05: ["-40"],
+    0x06: ["x100/128", "-100"],
+    0x07: ["x100/128", "-100"],
+    0x0A: ["x3"],
+    0x0B: [],
+    0x0C: ["/4"],
+    0x0D: [],
+    0x0E: ["/2", "-64"],
+    0x0F: ["-40"],
+    0x10: ["/100"],
+    0x11: ["x100/255"],
+    0x1F: [],
+    0x21: [],
+    0x2F: ["x100/255"],
+    0x31: [],
+    0x33: [],
+    0x42: ["/1000"],
+    0x45: ["x100/255"],
+    0x46: ["-40"],
+    0x49: ["x100/255"],
+    0x5C: ["-40"],
+    0x5E: ["/20"],
+    0xA6: ["/10"],
+}
+
+
+def _assign_cts(pids: list[int]) -> dict[int, tuple[int, bool]]:
+    """
+    Escolhe o CT (canal de destino) de cada PID da biblioteca.
+
+    Primeiro reserva os canais documentados em VIRLOC_CT; depois distribui
+    canais livres a partir de CT_FALLBACK_BASE para os PIDs restantes. O
+    segundo item da tupla diz se o canal é o documentado (True) ou apenas uma
+    sugestão a conferir (False).
+    """
+    resultado: dict[int, tuple[int, bool]] = {}
+    usados: set[int] = set()
+
+    # 1ª passada: canais oficiais, na ordem dos PIDs.
+    for pid in pids:
+        ct = VIRLOC_CT.get(pid)
+        if ct is not None and ct not in usados:
+            resultado[pid] = (ct, True)
+            usados.add(ct)
+
+    # 2ª passada: os demais recebem o primeiro canal livre acima da base.
+    proximo = CT_FALLBACK_BASE
+    for pid in pids:
+        if pid in resultado:
+            continue
+        while proximo in usados and proximo < CT_MAX:
+            proximo += 1
+        resultado[pid] = (proximo, False)
+        usados.add(proximo)
+        proximo += 1
+    return resultado
+
+
+def build_can_library(entries: list[tuple[int, int, bool]],
+                      baudrate: int = 500000,
+                      model: str = "VEICULO") -> list[tuple[str, str]]:
+    """
+    Monta as linhas da biblioteca CAN (VIRLOC) para leitura de PIDs OBD-II.
+
+    Parâmetros:
+      entries  — lista de (pid, id_de_resposta, confirmado). 'confirmado' é
+                 True quando o PID realmente respondeu no veículo; False
+                 quando é só uma intenção de leitura (PID marcado na tabela).
+      baudrate — taxa do barramento em bits/s (vira kbps na linha VS19_ENA).
+      model    — modelo do veículo gravado no registro de texto (VSRT).
+
+    Retorna uma lista de pares (linha, comentário) na ordem em que devem ser
+    enviadas ao equipamento. Entradas além de LIB_MAX_FILTERS são descartadas,
+    pois o equipamento só tem 25 filtros (VS1900..VS1924).
+    """
+    # Remove repetições preservando a ordem e respeita o limite de filtros.
+    vistos: set[tuple[int, int]] = set()
+    itens: list[tuple[int, int, bool]] = []
+    for pid, resp_id, ok in entries:
+        chave = (pid, resp_id)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        itens.append((pid, resp_id, ok))
+    itens = itens[:LIB_MAX_FILTERS]
+
+    def nome_pid(pid: int) -> str:
+        info = PID_DATABASE.get(pid)
+        return info.name if info else f"PID 0x{pid:02X} (não catalogado)"
+
+    linhas: list[tuple[str, str]] = []
+
+    # ── Bloco 1: habilitação da CAN ──────────────────────────────────────────
+    kbps = int(round((baudrate or 500000) / 1000))
+    linhas.append((
+        f">VS19_ENA{kbps:04d},1<",
+        f"baudrate {kbps} kbps — ATIVA A CAN EM MODO NORMAL (necessário para "
+        "transmitir os requests OBD-II)"))
+
+    # ── Bloco 2: consulta de PIDs ────────────────────────────────────────────
+    pids = sorted({p for p, _, _ in itens})
+    if pids:
+        linhas.append((f">VOBD_ENA1,{max(pids)}<",
+                       "CONSULTA DE PIDS (habilita a varredura automática)"))
+        for pid in pids:
+            linhas.append((f">VOBD{pid},2<",
+                           f"consulta o PID {pid} (0x{pid:02X}) — {nome_pid(pid)}"))
+
+    # ── Bloco 3: registros de identificação ──────────────────────────────────
+    linhas.append((">VSRM11,2,98,98<",
+                   "registro conforme a biblioteca de referência — confirme "
+                   "no manual do equipamento"))
+    modelo = (model or "VEICULO").strip().upper().replace(" ", "_") or "VEICULO"
+    linhas.append((f">VSRT98,{modelo}.0<", "modelo do veículo"))
+
+    # ── Bloco 4a: filtros VS ─────────────────────────────────────────────────
+    cts = _assign_cts([p for p, _, _ in itens])
+    for n, (pid, resp_id, confirmado) in enumerate(itens):
+        info = PID_DATABASE.get(pid)
+        length = max(1, min(info.n_bytes if info else 1, 4))
+        mask = f"{(1 << (length * 8)) - 1:08X}"
+        ct, ct_oficial = cts[pid]
+        obs = []
+        if not ct_oficial:
+            obs.append("CT sugerido — confirme na biblioteca")
+        if not confirmado:
+            obs.append("PID ainda não confirmado no veículo")
+        sufixo = f"  [{'; '.join(obs)}]" if obs else ""
+        linhas.append((
+            f">VS19{n:02d},{resp_id:05d},{pid},11,{ct:02d},4,{length},"
+            f"{mask},0,3<",
+            f"{nome_pid(pid)} — ECU 0x{resp_id:03X}, PID {pid} "
+            f"(0x{pid:02X}), {length} byte(s), CT{ct:02d}{sufixo}"))
+
+    # ── Bloco 4b: linhas MAT (conversão para valor de engenharia) ────────────
+    for n, (pid, _, _) in enumerate(itens):
+        ops = MAT_OPS.get(pid, [])
+        if not ops:
+            continue    # valor bruto já é o final → não precisa de MAT
+        info = PID_DATABASE.get(pid)
+        unidade = f" [{info.unit}]" if info and info.unit else ""
+        linhas.append((
+            f">VS19{n:02d}_MAT,{','.join(ops)}<",
+            f"MAT {nome_pid(pid)}: {formula_text(pid)}{unidade}"))
+
+    return linhas

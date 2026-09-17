@@ -297,6 +297,12 @@ class CANBus:
         elif pid == 0x42:    # Tensão módulo = (256A+B)/1000
             mv = 13800
             payload = [(mv >> 8) & 0xFF, mv & 0xFF]
+        elif pid in (0x45, 0x49):   # Borboleta relativa / pedal = A*100/255
+            payload = [int(max(0, min(255, s._throttle * 255 / 100)))]
+        elif pid == 0xA6:    # Odômetro = (A,B,C,D)/10 km  → 4 bytes
+            raw = int(max(0, s._odometer) * 10)
+            payload = [(raw >> 24) & 0xFF, (raw >> 16) & 0xFF,
+                       (raw >> 8) & 0xFF, raw & 0xFF]
         elif pid == 0x00:    # PIDs suportados 01-20 (bitmap) — devolve alguns
             payload = [0x18, 0x3B, 0x80, 0x13]
         if payload is None:

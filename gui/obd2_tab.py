@@ -29,14 +29,15 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QMessageBox,
-    QFileDialog,
+    QFileDialog, QInputDialog,
 )
 
 from core.can_bus import CANMessage
 from core.obd2 import (
-    PID_DATABASE, ECU_NAMES, PROTOCOL_NOTES, OBD_REQUEST_FUNCTIONAL,
-    OBD_REQUEST_PHYSICAL_BASE, OBD_RESP_MIN, OBD_RESP_MAX,
-    build_request, parse_response, ecu_name, formula_text,
+    PID_DATABASE, ECU_NAMES, PROTOCOL_NOTES, VS_FIELD_DOC, LIB_MAX_FILTERS,
+    OBD_REQUEST_FUNCTIONAL, OBD_REQUEST_PHYSICAL_BASE, OBD_RESP_MIN,
+    OBD_RESP_MAX, build_request, parse_response, ecu_name, formula_text,
+    build_can_library,
 )
 from gui.styles import COLORS
 
@@ -81,6 +82,9 @@ class OBD2Tab(QWidget):
         self._doc_req: dict[tuple[int, int], dict] = {}
         self._doc_obs: dict[tuple[int, int], dict] = {}
         self._doc_start: float = 0.0   # instante do 1º request da sessão
+        # Modelo do veículo usado na folha "Biblioteca CAN" (o usuário informa
+        # na hora de exportar; guardamos para não digitar de novo).
+        self._doc_model = "VEICULO"
 
         self._setup_ui()
 
@@ -672,6 +676,35 @@ class OBD2Tab(QWidget):
             ])
         return rows
 
+    # Cabeçalhos da folha de biblioteca CAN.
+    DOC_LIB_HEADERS = ["#", "Linha (enviar ao equipamento)", "Comentário"]
+
+    def _library_entries(self) -> tuple[list[tuple[int, int, bool]], bool]:
+        """
+        Escolhe quais PIDs entram na biblioteca CAN.
+
+        Preferimos os pares (PID, ECU) que REALMENTE responderam — é a prova de
+        que aquele PID existe no veículo e de qual módulo vem a resposta. Se
+        nada respondeu ainda, caímos nos PIDs marcados na tabela, assumindo a
+        ECU 1 (0x7E8), e sinalizamos que são não confirmados.
+
+        Devolve (entradas, confirmadas).
+        """
+        if self._doc_obs:
+            return [(pid, src, True) for (pid, src) in sorted(self._doc_obs)], True
+        return [(pid, OBD_RESP_MIN, False) for pid in self._active_pids()], False
+
+    def _rows_library(self) -> list[list]:
+        """Linhas da biblioteca CAN numeradas, prontas para a planilha/TXT."""
+        entries, _ = self._library_entries()
+        # O baudrate da linha VS19_ENA vem da conexão real; 500 kbps é o padrão
+        # OBD-II e serve de reserva quando não há conexão registrada.
+        bitrate = self._bus.bitrate if (self._bus and self._bus.bitrate) else 500000
+        linhas = build_can_library(entries, baudrate=bitrate,
+                                   model=self._doc_model)
+        return [[i, linha, coment]
+                for i, (linha, coment) in enumerate(linhas, start=1)]
+
     @pyqtSlot()
     def _export_doc(self):
         """
@@ -695,6 +728,14 @@ class OBD2Tab(QWidget):
             )
             if resp != QMessageBox.Yes:
                 return
+
+        # Modelo do veículo — vai no registro VSRT da folha "Biblioteca CAN".
+        modelo, ok = QInputDialog.getText(
+            self, "Modelo do veículo",
+            "Modelo do veículo (usado na folha 'Biblioteca CAN'):",
+            text=self._doc_model)
+        if ok and modelo.strip():
+            self._doc_model = modelo.strip()
 
         # Sugere a pasta Documents/IxxatInterface (mesma dos logs de sessão).
         nome = f"protocolo_obd2_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
@@ -817,7 +858,41 @@ class OBD2Tab(QWidget):
         tabela(ws, self.DOC_NORESP_HEADERS, self._rows_no_response(), 3,
                widths=[10, 9, 32, 14, 26, 16, 60])
 
-        # ── Aba 4: referência do protocolo ───────────────────────────────────
+        # ── Aba 4: biblioteca CAN pronta para o equipamento ──────────────────
+        ws = wb.create_sheet("Biblioteca CAN")
+        titulo(ws, "BIBLIOTECA CAN (VIRLOC) — CONSULTA DE PIDs OBD-II",
+               len(self.DOC_LIB_HEADERS))
+        entries, confirmadas = self._library_entries()
+        nota = ("Linhas prontas para envio ao equipamento, na ordem abaixo. "
+                "Os filtros foram gerados a partir dos PIDs que RESPONDERAM "
+                "neste veículo."
+                if confirmadas else
+                "ATENÇÃO: nenhum PID respondeu nesta sessão — as linhas abaixo "
+                "usam os PIDs MARCADOS na tabela e assumem a ECU 1 (0x7E8). "
+                "Confirme fazendo uma leitura antes de aplicar no equipamento.")
+        if len(entries) > LIB_MAX_FILTERS:
+            nota += (f" Apenas os {LIB_MAX_FILTERS} primeiros sinais entraram: "
+                     f"o equipamento só tem {LIB_MAX_FILTERS} filtros "
+                     f"(VS1900..VS19{LIB_MAX_FILTERS - 1:02d}).")
+        c = ws.cell(row=2, column=1, value=nota)
+        c.alignment = wrap
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=3)
+        ws.row_dimensions[2].height = 30
+        prox = tabela(ws, self.DOC_LIB_HEADERS, self._rows_library(), 4,
+                      widths=[5, 46, 92])
+        # Legenda campo a campo do filtro VS, logo abaixo das linhas.
+        prox += 1
+        c = ws.cell(row=prox, column=1,
+                    value="CAMPOS DO FILTRO:  "
+                          ">VS19ff,iiiii,ppp,11,cc,4,n,mmmmmmmm,0,3<")
+        c.font = bold
+        ws.merge_cells(start_row=prox, start_column=1,
+                       end_row=prox, end_column=3)
+        tabela(ws, ["", "Campo", "Significado"],
+               [["", campo, texto] for campo, texto in VS_FIELD_DOC], prox + 1)
+        ws.freeze_panes = None
+
+        # ── Aba 5: referência do protocolo ───────────────────────────────────
         ws = wb.create_sheet("Protocolo")
         titulo(ws, "COMO O DIÁLOGO OBD-II FUNCIONA (referência da norma)", 2)
         ws.column_dimensions["A"].width = 24
@@ -839,7 +914,7 @@ class OBD2Tab(QWidget):
                ecu_rows, r)
         ws.freeze_panes = None
 
-        # ── Aba 5: banco de PIDs do programa ─────────────────────────────────
+        # ── Aba 6: banco de PIDs do programa ─────────────────────────────────
         ws = wb.create_sheet("Banco de PIDs")
         titulo(ws, "PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modo 01)",
                len(self.DOC_DB_HEADERS))
@@ -882,7 +957,28 @@ class OBD2Tab(QWidget):
         L.append("-" * 100)
         L += tabela(self.DOC_NORESP_HEADERS, self._rows_no_response())
         L.append("")
-        L.append("4) COMO O DIÁLOGO OBD-II FUNCIONA (referência da norma)")
+        L.append("4) BIBLIOTECA CAN (VIRLOC) — CONSULTA DE PIDs OBD-II")
+        L.append("-" * 100)
+        entries, confirmadas = self._library_entries()
+        if not confirmadas:
+            L.append("  ATENÇÃO: nenhum PID respondeu nesta sessão. As linhas abaixo usam os")
+            L.append("  PIDs MARCADOS na tabela e assumem a ECU 1 (0x7E8) — confirme com uma")
+            L.append("  leitura antes de aplicar no equipamento.")
+        if len(entries) > LIB_MAX_FILTERS:
+            L.append(f"  OBS: só os {LIB_MAX_FILTERS} primeiros sinais entraram "
+                     f"(limite de filtros do equipamento).")
+        L.append("")
+        # Formato igual ao do arquivo de biblioteca: >LINHA<  // comentário
+        lib = self._rows_library()
+        larg = max((len(r[1]) for r in lib), default=0)
+        for _, linha, coment in lib:
+            L.append(f"  {linha.ljust(larg)}  // {coment}")
+        L.append("")
+        L.append("  CAMPOS DO FILTRO:  >VS19ff,iiiii,ppp,11,cc,4,n,mmmmmmmm,0,3<")
+        for campo, texto in VS_FIELD_DOC:
+            L.append(f"    {campo:<10} {texto}")
+        L.append("")
+        L.append("5) COMO O DIÁLOGO OBD-II FUNCIONA (referência da norma)")
         L.append("-" * 100)
         for topico, texto in PROTOCOL_NOTES:
             L.append(f"  • {topico}:")
@@ -903,7 +999,7 @@ class OBD2Tab(QWidget):
                       f"0x{OBD_REQUEST_PHYSICAL_BASE + (rid - OBD_RESP_MIN):03X}"]
                      for rid, nome in sorted(ECU_NAMES.items())])
         L.append("")
-        L.append("5) PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modo 01)")
+        L.append("6) PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modo 01)")
         L.append("-" * 100)
         L += tabela(self.DOC_DB_HEADERS, self._rows_database())
         L.append("")
