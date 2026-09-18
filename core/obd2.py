@@ -216,20 +216,52 @@ def build_request(pid: int, target_ecu: Optional[int] = None) -> tuple[int, byte
     return can_id, data
 
 
+def decode_mode01_payload(payload: bytes) -> Optional[dict]:
+    """
+    Decodifica o PAYLOAD (já sem o byte de PCI do ISO-TP) de uma resposta
+    do modo 01: [0x41, PID, A, B, ...].
+
+    Separado de parse_response() porque a resposta pode chegar de dois jeitos:
+    num único quadro CAN (o caso normal, tratado por parse_response) ou
+    remontada pelo ISO-TP a partir de vários quadros — e as duas rotas
+    precisam decodificar exatamente igual.
+
+    Retorna {pid, value, unit, name, data} ou None.
+    """
+    if len(payload) < 2:
+        return None
+    if payload[0] != 0x41:        # 0x41 = 0x01 (modo) + 0x40 (flag de resposta)
+        return None
+    pid = payload[1]
+    info = PID_DATABASE.get(pid)
+    if info is None:
+        return None
+    dados = list(payload[2:2 + info.n_bytes])
+    if len(dados) < info.n_bytes:
+        return None
+    try:
+        value = info.formula(dados)
+    except Exception:
+        return None
+    return {"pid": pid, "value": value, "unit": info.unit,
+            "name": info.name, "data": bytes(dados)}
+
+
 def parse_response(can_id: int, data: bytes) -> Optional[dict]:
     """
     Interpreta um quadro de RESPOSTA OBD-II modo 01.
 
-    Retorna um dicionário {src, pid, value, unit, name} quando o quadro é uma
-    resposta válida de um PID conhecido, ou None caso contrário.
+    Retorna um dicionário {src, pid, value, unit, name, data} quando o quadro é
+    uma resposta válida de um PID conhecido, ou None caso contrário.
 
     O campo 'src' é a ID da ECU que respondeu (0x7E8..0x7EF) e é ESSENCIAL:
     com request funcional (0x7DF) várias ECUs respondem ao mesmo PID, cada uma
     com o SEU valor. Sem saber a origem, respostas de módulos diferentes se
     confundiriam como se fossem a mesma leitura.
 
-    Só trata Single Frame (SF): o nibble alto do byte 0 deve ser 0 e o byte 1
-    deve ser 0x41 (resposta ao modo 01). Multi-frame é ignorado.
+    Só trata Single Frame (SF): o nibble alto do byte 0 deve ser 0. Respostas
+    multi-frame são remontadas pelo IsoTpReader (core/uds.py) e decodificadas
+    por decode_mode01_payload().
     """
     # A resposta tem que vir na faixa física 0x7E8..0x7EF.
     if not (OBD_RESP_MIN <= can_id <= OBD_RESP_MAX):
@@ -240,25 +272,17 @@ def parse_response(can_id: int, data: bytes) -> Optional[dict]:
     # ISO-TP: nibble alto do 1º byte identifica o tipo de frame (0 = Single).
     if (data[0] >> 4) != 0:
         return None
-    if data[1] != 0x41:           # 0x41 = 0x01 (modo) + 0x40 (flag de resposta)
-        return None
 
-    pid = data[2]
-    info = PID_DATABASE.get(pid)
-    if info is None:
-        return None
-
-    payload = list(data[3:3 + info.n_bytes])
-    if len(payload) < info.n_bytes:
-        return None
-    try:
-        value = info.formula(payload)
-    except Exception:
+    # Tudo após o PCI é o payload. Não usamos o comprimento declarado aqui:
+    # algumas ECUs preenchem esse nibble de forma descuidada, e ser tolerante
+    # custa nada (a fórmula do PID já sabe quantos bytes consumir).
+    res = decode_mode01_payload(bytes(data[1:]))
+    if res is None:
         return None
     # 'src' preserva QUAL ECU respondeu — sem isso, respostas de módulos
     # diferentes para o mesmo PID seriam indistinguíveis.
-    return {"src": can_id, "pid": pid, "value": value,
-            "unit": info.unit, "name": info.name}
+    res["src"] = can_id
+    return res
 
 
 # ════════════════════════════════════════════════════════════════════════════

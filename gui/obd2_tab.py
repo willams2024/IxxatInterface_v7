@@ -1,22 +1,42 @@
 """
-Aba "OBD-II" (PyQt5) — leitura de PIDs padrão SAE J1979 sobre CAN.
+Aba "OBD-II / UDS" (PyQt5) — leitura de diagnóstico por pergunta/resposta.
 
 DIFERENÇA FUNDAMENTAL para as outras abas:
     O Monitor CAN e a Descoberta de Sinais são PASSIVOS (só escutam o que as
-    ECUs J1939 transmitem sozinhas). O OBD-II é pergunta/resposta: esta aba
-    precisa TRANSMITIR um request para cada PID e aguardar a resposta da ECU.
+    ECUs transmitem sozinhas). Esta aba é a ÚNICA que TRANSMITE: diagnóstico
+    é pergunta/resposta, a ECU só fala se for perguntada.
 
     Por isso, ela exige que a conexão esteja com "Listen-Only" DESMARCADO.
     Em modo Simulação, o CANBus fabrica respostas sintéticas, permitindo
     testar a aba sem hardware.
 
-Fluxo:
-    1) O usuário marca os PIDs de interesse na tabela.
-    2) "Ler uma vez" envia um request por PID marcado.
-    3) "Stream" liga um timer que fica consultando os PIDs em rodízio.
-    4) As respostas chegam por on_message() (thread do CAN) e são acumuladas;
-       um timer da GUI atualiza a tabela (nunca mexemos em widgets fora da
-       thread da interface).
+DOIS SERVIÇOS, O MESMO CANAL:
+    • OBD-II modo 01 (SAE J1979) — PIDs de 1 byte, resposta 0x41. É o
+      diagnóstico legislado, igual em qualquer veículo.
+    • UDS $22 (ISO 14229) — DIDs de 2 bytes, resposta 0x62. É onde ficam os
+      sinais proprietários das montadoras (ex.: a lista da VWCO).
+    Os dois usam as mesmas IDs (0x7DF → 0x7E8..0x7EF) e o mesmo transporte
+    ISO-TP, então a tabela lista PIDs e DIDs juntos, com a coluna "Tipo"
+    dizendo qual serviço cada linha usa.
+
+REGRAS DE SEGURANÇA QUE ESTA ABA RESPEITA:
+    1) Só serviços de LEITURA (0x01 e 0x22). A lista branca de transmissão do
+       CANBus (tx_policy_check) recusa qualquer outro no portão.
+    2) NÃO troca a sessão de diagnóstico. Se um DID responder que exige sessão
+       estendida, a aba REPORTA o código negativo e para — escalar a sessão
+       poderia degradar o veículo.
+    3) UM REQUEST PENDENTE POR VEZ. Sem isso, uma transferência multi-frame se
+       misturaria com o request seguinte, e uma resposta negativa (que não
+       repete o DID) não teria dono.
+    4) Flow Control só é enviado quando HÁ um request nosso pendente — assim
+       não atropelamos a transferência de outro equipamento de diagnóstico
+       conectado no mesmo barramento.
+
+REPARTIÇÃO ENTRE THREADS:
+    on_message() roda na thread do CAN e só faz uma coisa: enfileirar os
+    quadros que estão na faixa de resposta de diagnóstico. TODA a máquina de
+    estados (ISO-TP, request pendente, timeouts) e toda a atualização de
+    widgets acontecem em _drain_responses(), na thread da interface.
 """
 
 import os
@@ -36,8 +56,13 @@ from core.can_bus import CANMessage
 from core.obd2 import (
     PID_DATABASE, ECU_NAMES, PROTOCOL_NOTES, VS_FIELD_DOC, LIB_MAX_FILTERS,
     OBD_REQUEST_FUNCTIONAL, OBD_REQUEST_PHYSICAL_BASE, OBD_RESP_MIN,
-    OBD_RESP_MAX, build_request, parse_response, ecu_name, formula_text,
-    build_can_library,
+    OBD_RESP_MAX, build_request, decode_mode01_payload, ecu_name,
+    formula_text, build_can_library,
+)
+from core.uds import (
+    DID_DATABASE, PRIORITY_DIDS, UDS_PROTOCOL_NOTES, FLOW_CONTROL_CTS,
+    IsoTpReader, build_read_did_request, parse_read_did_response,
+    flow_control_id_for, interpret, raw_to_int, format_hex, nrc_name,
 )
 from gui.styles import COLORS
 
@@ -45,63 +70,97 @@ from gui.styles import COLORS
 # sessão da descoberta de sinais, para o usuário achar tudo no mesmo lugar).
 DOC_DIR = os.path.join(os.path.expanduser("~"), "Documents", "IxxatInterface")
 
+# Tipos de item da tabela. Um item é a tupla (KIND, número):
+#   ("pid", 0x0C)   → OBD-II modo 01, PID 0x0C
+#   ("did", 0x0101) → UDS $22, DID 0x0101
+KIND_PID = "pid"
+KIND_DID = "did"
+
+# PIDs e DIDs já marcados ao abrir o programa: os mais usados do OBD-II mais
+# os sinais que a montadora marcou como prioritários.
+DEFAULT_PIDS = (0x0C, 0x0D, 0x05, 0x11)
+
 
 class OBD2Tab(QWidget):
-    """Aba de leitura de PIDs OBD-II (modo 01 — dados atuais)."""
+    """Aba de leitura de diagnóstico: PIDs OBD-II (modo 01) e DIDs UDS ($22)."""
 
     # Colunas da tabela
-    (COL_ATIVO, COL_PID, COL_NOME, COL_VALOR,
-     COL_UNID, COL_FONTE, COL_STATUS) = range(7)
+    (COL_ATIVO, COL_TIPO, COL_ID, COL_NOME, COL_VALOR,
+     COL_UNID, COL_BRUTO, COL_FONTE, COL_STATUS) = range(9)
+
+    # Cadência do despachante de requests e da atualização da tabela.
+    DISPATCH_MS = 60
+    DRAIN_MS = 60
+    # Intervalo mínimo entre requests durante o stream (~8 req/s): rápido o
+    # bastante para acompanhar o sinal e gentil com o gateway do veículo.
+    STREAM_MIN_GAP = 0.125
+    # Tempo que esperamos a resposta antes de desistir do request pendente.
+    # Acima do N_Bs/N_Cr típico do ISO-TP (1 s) para dar margem ao gateway.
+    REQ_TIMEOUT = 1.2
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bus = None
-        # Fila de respostas recebidas na thread do CAN; consumida pelo timer
-        # da GUI. deque com limite evita crescimento sem controle.
-        self._pending: deque = deque(maxlen=2000)
-        # Mapeia PID -> índice da linha na tabela (para atualizar valores).
-        self._pid_rows: dict[int, int] = {}
-        # Mapeia PID -> conjunto de IDs de ECU que já responderam aquele PID.
-        # Com request funcional (0x7DF) VÁRIAS ECUs podem responder o mesmo
-        # PID com valores diferentes; guardamos as origens para avisar o
-        # operador em vez de sobrescrever silenciosamente a mesma célula.
-        self._pid_sources: dict[int, set] = {}
-        # Lista de PIDs ativos usada no rodízio do stream, e o índice atual.
-        self._poll_order: list[int] = []
+
+        # ── Comunicação entre threads ────────────────────────────────────────
+        # A thread do CAN só empilha aqui; a thread da GUI consome. deque com
+        # limite evita crescimento sem controle se a GUI ficar ocupada.
+        self._frames: deque = deque(maxlen=4000)
+
+        # ── Estado da tabela ─────────────────────────────────────────────────
+        self._rows: dict[tuple, int] = {}          # item -> linha da tabela
+        # item -> conjunto de ECUs que responderam. Em broadcast VÁRIAS ECUs
+        # podem responder o mesmo PID/DID com valores diferentes; guardamos as
+        # origens para avisar o operador em vez de sobrescrever a célula.
+        self._sources: dict[tuple, set] = {}
+
+        # ── Máquina de estados das consultas (só thread da GUI) ──────────────
+        self._isotp = IsoTpReader()        # remontagem multi-frame
+        self._queue: list = []             # fila do "Ler uma vez"
+        self._poll_order: list = []        # rodízio do stream
         self._poll_idx = 0
         self._streaming = False
+        # Request pendente: {"item", "can_id", "data", "sent"} ou None.
+        # É o coração da regra "um request por vez".
+        self._inflight = None
+        self._last_sent = 0.0
 
         # ── Registro para a DOCUMENTAÇÃO exportável ──────────────────────────
         # Acumula, ao longo de toda a sessão, o que realmente circulou no
-        # barramento: quais requests saíram e quais respostas voltaram (de qual
-        # ECU, com quais bytes crus). É a matéria-prima do botão "Exportar
-        # Documentação" — sem isso o arquivo seria só teoria, não o protocolo
-        # observado neste veículo.
-        #   _doc_req: (pid, can_id do request) -> {count, data, first_ts}
-        #   _doc_obs: (pid, id da ECU)         -> {count, valores, bytes crus}
-        self._doc_req: dict[tuple[int, int], dict] = {}
-        self._doc_obs: dict[tuple[int, int], dict] = {}
-        self._doc_start: float = 0.0   # instante do 1º request da sessão
+        # barramento. É a matéria-prima do botão "Exportar Documentação" — sem
+        # isso o arquivo seria só teoria, não o protocolo observado.
+        #   _doc_req: (kind, num, id do request) -> {count, data, first}
+        #   _doc_obs: (kind, num, id da ECU)     -> {count, valores, bytes}
+        #   _doc_nrc: (kind, num)                -> {nrc, count, src}
+        self._doc_req: dict[tuple, dict] = {}
+        self._doc_obs: dict[tuple, dict] = {}
+        self._doc_nrc: dict[tuple, dict] = {}
+        self._doc_start: float = 0.0    # instante do 1º request da sessão
+        self._doc_fc_sent = 0           # quantos Flow Control transmitimos
+        self._doc_timeouts = 0          # requests que estouraram o timeout
         # Modelo do veículo usado na folha "Biblioteca CAN" (o usuário informa
         # na hora de exportar; guardamos para não digitar de novo).
         self._doc_model = "VEICULO"
 
         self._setup_ui()
 
-        # Timer que atualiza a tabela com as respostas recebidas (thread GUI).
+        # Timer que processa as respostas e atualiza a tabela (thread da GUI).
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._drain_responses)
-        self._ui_timer.start(120)
+        self._ui_timer.start(self.DRAIN_MS)
 
-        # Timer do rodízio de requests durante o stream.
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._poll_next)
+        # Timer do despachante: envia no máximo um request por vez.
+        self._dispatch_timer = QTimer(self)
+        self._dispatch_timer.timeout.connect(self._dispatch_next)
+        self._dispatch_timer.start(self.DISPATCH_MS)
 
     def set_bus(self, bus):
         """Recebe a referência do CANBus (usada para transmitir os requests)."""
         self._bus = bus
 
-    # ── Construção da interface ──────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    #  Construção da interface
+    # ════════════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -110,7 +169,7 @@ class OBD2Tab(QWidget):
 
         # Cabeçalho
         hdr = QHBoxLayout()
-        title = QLabel("Leitura OBD-II (SAE J1979 — Modo 01)")
+        title = QLabel("Leitura de Diagnóstico — OBD-II (modo 01) e UDS ($22)")
         title.setObjectName("label_title")
         hdr.addWidget(title)
         hdr.addStretch()
@@ -133,21 +192,21 @@ class OBD2Tab(QWidget):
         self._btn_stream.toggled.connect(self._toggle_stream)
         hdr.addWidget(self._btn_stream)
 
-        # Exporta um arquivo documentando o diálogo OBD-II observado.
+        # Exporta um arquivo documentando o diálogo observado.
         self._btn_doc = QPushButton("📄  Exportar Documentação")
         self._btn_doc.clicked.connect(self._export_doc)
         self._btn_doc.setToolTip(
-            "Gera um arquivo (.xlsx ou .txt) documentando o protocolo OBD-II\n"
-            "desta sessão: requests transmitidos, respostas recebidas por ECU,\n"
-            "bytes crus, fórmulas de conversão, PIDs sem resposta e a\n"
-            "referência da norma SAE J1979 / ISO 15765-4."
+            "Gera um arquivo (.xlsx ou .txt) documentando o protocolo desta\n"
+            "sessão: requests transmitidos, respostas por ECU, bytes crus,\n"
+            "respostas negativas (NRC), conversões, biblioteca CAN pronta e a\n"
+            "referência das normas SAE J1979 / ISO 14229 / ISO 15765-4."
         )
         hdr.addWidget(self._btn_doc)
         layout.addLayout(hdr)
 
-        # ── Seletor de ECU alvo ───────────────────────────────────────────────
+        # ── Seletor de ECU alvo ──────────────────────────────────────────────
         # Com "Todas" (0x7DF) o request é broadcast e vários módulos respondem
-        # o mesmo PID, cada um com seu valor. Endereçar uma ECU específica
+        # o mesmo PID/DID, cada um com seu valor. Endereçar uma ECU específica
         # (0x7E0+n) elimina essa ambiguidade.
         ecu_row = QHBoxLayout()
         ecu_row.addWidget(QLabel("ECU alvo:"))
@@ -157,9 +216,9 @@ class OBD2Tab(QWidget):
             self._cmb_ecu.addItem(
                 f"Somente ECU {n + 1} (0x{0x7E0 + n:03X})", n)
         self._cmb_ecu.setToolTip(
-            "Broadcast: todas as ECUs respondem — o MESMO PID pode voltar com\n"
-            "valores diferentes de módulos diferentes (a coluna Fonte mostra a\n"
-            "origem e avisa quando há conflito).\n"
+            "Broadcast: todas as ECUs respondem — o MESMO PID/DID pode voltar\n"
+            "com valores diferentes de módulos diferentes (a coluna Fonte\n"
+            "mostra a origem e avisa quando há conflito).\n"
             "ECU específica: só aquele módulo responde, sem ambiguidade."
         )
         self._cmb_ecu.setMinimumWidth(260)
@@ -169,8 +228,10 @@ class OBD2Tab(QWidget):
 
         # Aviso sobre transmissão / listen-only
         self._lbl_warn = QLabel(
-            "⚠️  O OBD-II precisa TRANSMITIR requests. Conecte com "
-            "'Listen-Only' DESMARCADO (ou use Modo Simulação para testar)."
+            "⚠️  Esta aba TRANSMITE requests de leitura (serviços 0x01 e 0x22). "
+            "Conecte com 'Listen-Only' DESMARCADO (ou use Modo Simulação para "
+            "testar). Nenhum serviço de escrita, atuação ou troca de sessão é "
+            "usado — a lista branca do programa recusa todos eles."
         )
         self._lbl_warn.setStyleSheet(
             f"color: {COLORS['warning']}; font-size: 11px; padding: 4px;")
@@ -181,21 +242,20 @@ class OBD2Tab(QWidget):
         self._lbl_status = QLabel("Pronto.")
         self._lbl_status.setStyleSheet(
             f"color: {COLORS['text_muted']}; font-size: 12px;")
+        self._lbl_status.setWordWrap(True)
         layout.addWidget(self._lbl_status)
 
-        # Tabela de PIDs
-        self._table = QTableWidget(0, 7)
+        # Tabela de PIDs e DIDs
+        self._table = QTableWidget(0, 9)
         self._table.setHorizontalHeaderLabels(
-            ["Ler", "PID", "Parâmetro", "Valor", "Unidade",
-             "Fonte (ECU)", "Status"])
+            ["Ler", "Tipo", "PID / DID", "Sinal", "Valor", "Unidade",
+             "Dados (bruto)", "Fonte (ECU)", "Status"])
         h = self._table.horizontalHeader()
-        h.setSectionResizeMode(self.COL_ATIVO,  QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(self.COL_PID,    QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(self.COL_NOME,   QHeaderView.Stretch)
-        h.setSectionResizeMode(self.COL_VALOR,  QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(self.COL_UNID,   QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(self.COL_FONTE,  QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeToContents)
+        for col in (self.COL_ATIVO, self.COL_TIPO, self.COL_ID, self.COL_VALOR,
+                    self.COL_UNID, self.COL_BRUTO, self.COL_FONTE,
+                    self.COL_STATUS):
+            h.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(self.COL_NOME, QHeaderView.Stretch)
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
         self._table.setStyleSheet("""
@@ -220,18 +280,31 @@ class OBD2Tab(QWidget):
         self._populate_table()
 
     def _populate_table(self):
-        """Cria uma linha para cada PID do banco, ordenada pelo número do PID."""
+        """
+        Cria uma linha por PID e por DID.
+
+        Os PIDs vêm primeiro (ordenados pelo número), depois os DIDs. Os DIDs
+        prioritários da montadora e os PIDs mais usados já vêm marcados, de
+        forma que o operador possa apertar "Ler Uma Vez" sem configurar nada.
+        """
         self._table.setRowCount(0)
-        self._pid_rows.clear()
-        for pid in sorted(PID_DATABASE.keys()):
-            info = PID_DATABASE[pid]
+        self._rows.clear()
+
+        itens = ([(KIND_PID, pid) for pid in sorted(PID_DATABASE)]
+                 + [(KIND_DID, did) for did in sorted(DID_DATABASE)])
+
+        for item in itens:
+            kind, num = item
             row = self._table.rowCount()
             self._table.insertRow(row)
-            self._pid_rows[pid] = row
+            self._rows[item] = row
 
             # Coluna 0: checkbox de seleção (widget próprio, centralizado)
             chk = QCheckBox()
-            chk.setChecked(pid in (0x0C, 0x0D, 0x05, 0x11))   # marca os mais usados
+            if kind == KIND_PID:
+                chk.setChecked(num in DEFAULT_PIDS)
+            else:
+                chk.setChecked(num in PRIORITY_DIDS)
             holder = QWidget()
             hl = QHBoxLayout(holder)
             hl.addWidget(chk)
@@ -240,20 +313,85 @@ class OBD2Tab(QWidget):
             self._table.setCellWidget(row, self.COL_ATIVO, holder)
 
             for col, text in (
-                (self.COL_PID,    f"0x{pid:02X}"),
-                (self.COL_NOME,   info.name),
+                (self.COL_TIPO,   self._item_service(item)),
+                (self.COL_ID,     self._item_label(item)),
+                (self.COL_NOME,   self._item_name(item)),
                 (self.COL_VALOR,  "—"),
-                (self.COL_UNID,   info.unit),
+                (self.COL_UNID,   self._item_unit(item)),
+                (self.COL_BRUTO,  "—"),
                 (self.COL_FONTE,  "—"),
                 (self.COL_STATUS, "aguardando"),
             ):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                cell = QTableWidgetItem(text)
+                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
                 align = Qt.AlignLeft if col == self.COL_NOME else Qt.AlignCenter
-                item.setTextAlignment(align | Qt.AlignVCenter)
-                self._table.setItem(row, col, item)
+                cell.setTextAlignment(align | Qt.AlignVCenter)
+                self._table.setItem(row, col, cell)
 
-    # ── Helpers de seleção ───────────────────────────────────────────────────
+            # Tooltip explica a conversão (e avisa quando é hipótese).
+            nome_cell = self._table.item(row, self.COL_NOME)
+            if nome_cell is not None:
+                nome_cell.setToolTip(self._item_conversion(item))
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Helpers de item (PID ou DID)
+    # ════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _item_service(item: tuple) -> str:
+        """Serviço usado pelo item, como aparece na coluna 'Tipo'."""
+        return "PID 01" if item[0] == KIND_PID else "DID 22"
+
+    @staticmethod
+    def _item_label(item: tuple) -> str:
+        """
+        Identificação do item.
+
+        PID sai com o decimal ao lado porque a biblioteca do equipamento
+        (VIRLOC) referencia PIDs em decimal; DID sai só em hexadecimal, como a
+        montadora documenta.
+        """
+        kind, num = item
+        return f"0x{num:02X} ({num})" if kind == KIND_PID else f"0x{num:04X}"
+
+    @staticmethod
+    def _item_name(item: tuple) -> str:
+        kind, num = item
+        info = PID_DATABASE.get(num) if kind == KIND_PID else DID_DATABASE.get(num)
+        return info.name if info else "—"
+
+    @staticmethod
+    def _item_unit(item: tuple) -> str:
+        kind, num = item
+        info = PID_DATABASE.get(num) if kind == KIND_PID else DID_DATABASE.get(num)
+        return (info.unit if info else "") or ""
+
+    @staticmethod
+    def _item_conversion(item: tuple) -> str:
+        """
+        Texto da conversão do item.
+
+        Para PID é a fórmula da norma (valor confiável). Para DID é a hipótese
+        registrada em core/uds.py — e o texto diz isso, porque a montadora não
+        informou as escalas.
+        """
+        kind, num = item
+        if kind == KIND_PID:
+            return f"SAE J1979: {formula_text(num)}"
+        info = DID_DATABASE.get(num)
+        if info is None:
+            return "—"
+        return (f"UDS $22 — conversão: {info.hypothesis or 'desconhecida'}"
+                f"\nEscala não informada pela montadora: confira o valor bruto.")
+
+    def _build_item_request(self, item: tuple, target) -> tuple:
+        """Monta (can_id, data) do request do item, conforme o serviço."""
+        kind, num = item
+        if kind == KIND_PID:
+            return build_request(num, target_ecu=target)
+        return build_read_did_request(num, target_ecu=target)
+
+    # ── Seleção na tabela ────────────────────────────────────────────────────
 
     def _checkbox_at(self, row: int) -> QCheckBox:
         """Devolve o QCheckBox da coluna 'Ler' de uma linha."""
@@ -266,72 +404,64 @@ class OBD2Tab(QWidget):
             if chk:
                 chk.setChecked(checked)
 
+    def _active_items(self) -> list:
+        """Itens (PIDs e DIDs) marcados pelo usuário, na ordem da tabela."""
+        return [item for item, row in sorted(self._rows.items(),
+                                             key=lambda kv: kv[1])
+                if (chk := self._checkbox_at(row)) and chk.isChecked()]
+
     def _active_pids(self) -> list[int]:
-        """Lista dos PIDs marcados pelo usuário."""
-        out = []
-        for pid, row in self._pid_rows.items():
-            chk = self._checkbox_at(row)
-            if chk and chk.isChecked():
-                out.append(pid)
-        return sorted(out)
+        """Só os PIDs marcados (usado pela biblioteca CAN, que é de PIDs)."""
+        return [num for (kind, num) in self._active_items() if kind == KIND_PID]
 
     def _target_ecu(self):
-        """
-        ECU alvo escolhida no combo: None = broadcast (0x7DF), 0..7 = física.
-        """
+        """ECU alvo escolhida no combo: None = broadcast, 0..7 = física."""
         return self._cmb_ecu.currentData()
 
-    # ── Verificação de pré-condições ─────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    #  Envio de requests (um por vez)
+    # ════════════════════════════════════════════════════════════════════════
 
     def _check_ready(self) -> bool:
         """Valida que dá para transmitir; explica ao usuário se não der."""
         if self._bus is None or not self._bus.is_connected:
             QMessageBox.warning(self, "Sem conexão",
-                                "Conecte ao barramento antes de ler PIDs OBD-II.")
+                                "Conecte ao barramento antes de consultar.")
             return False
         # Em hardware real, listen-only impede transmitir.
         if (not self._bus.is_simulation) and self._bus.is_listen_only:
             QMessageBox.warning(
                 self, "Listen-Only ativo",
-                "O OBD-II precisa TRANSMITIR requests para a ECU responder.\n\n"
+                "A leitura de diagnóstico precisa TRANSMITIR requests para a "
+                "ECU responder.\n\n"
                 "Desconecte, DESMARQUE a caixa 'Listen-Only' e conecte de novo."
             )
             return False
-        if not self._active_pids():
-            QMessageBox.information(self, "Nenhum PID marcado",
-                                    "Marque ao menos um PID na coluna 'Ler'.")
+        if not self._active_items():
+            QMessageBox.information(
+                self, "Nada marcado",
+                "Marque ao menos um PID ou DID na coluna 'Ler'.")
             return False
         return True
 
-    # ── Envio de requests ────────────────────────────────────────────────────
-
     @pyqtSlot()
     def _read_once(self):
-        """Envia um request para cada PID marcado (uma única rodada)."""
+        """
+        Enfileira uma rodada de consultas dos itens marcados.
+
+        Não transmite aqui: quem transmite é o despachante (_dispatch_next),
+        um request por vez. Mandar todos de uma vez embaralharia as respostas
+        multi-frame e deixaria as respostas negativas sem dono.
+        """
         if not self._check_ready():
             return
-        pids = self._active_pids()
-        target = self._target_ecu()
-        # Zera as origens conhecidas: uma nova leitura recomeça a detecção de
-        # conflito entre ECUs do zero.
-        self._pid_sources.clear()
-        enviados, erro = 0, None
-        for pid in pids:
-            can_id, data = build_request(pid, target_ecu=target)
-            ok, msg = self._bus.send(can_id, data, is_extended=False)
-            if ok:
-                enviados += 1
-                self._record_request(pid, can_id, data)
-                self._set_status(pid, "consultando...", COLORS['warning'])
-            else:
-                erro = msg
-                break
-        if erro:
-            self._lbl_status.setText(f"Falha ao transmitir: {erro}")
-            self._lbl_status.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
-        else:
-            self._lbl_status.setText(f"{enviados} request(s) enviado(s). Aguardando respostas...")
-            self._lbl_status.setStyleSheet(f"color: {COLORS['accent']}; font-size: 12px;")
+        itens = self._active_items()
+        self._sources.clear()      # nova leitura recomeça a detecção de conflito
+        self._queue = list(itens)
+        for item in itens:
+            self._set_status(item, "na fila", COLORS['text_muted'])
+        self._status_msg(f"{len(itens)} consulta(s) na fila "
+                         f"(uma por vez).", COLORS['accent'])
 
     @pyqtSlot(bool)
     def _toggle_stream(self, checked: bool):
@@ -340,192 +470,372 @@ class OBD2Tab(QWidget):
             if not self._check_ready():
                 self._btn_stream.setChecked(False)
                 return
-            self._poll_order = self._active_pids()
+            self._poll_order = self._active_items()
             self._poll_idx = 0
             self._streaming = True
-            self._pid_sources.clear()   # recomeça a detecção de conflito
+            self._sources.clear()
             self._btn_stream.setText("⏸  Parar Stream")
-            # ~8 requests/s: rápido o bastante e sem saturar o barramento.
-            self._poll_timer.start(125)
-            self._lbl_status.setText(
-                f"Stream ativo — {len(self._poll_order)} PID(s) em rodízio.")
-            self._lbl_status.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
+            self._status_msg(
+                f"Stream ativo — {len(self._poll_order)} item(ns) em rodízio, "
+                f"um request por vez.", COLORS['success'])
         else:
             self._streaming = False
-            self._poll_timer.stop()
             self._btn_stream.setText("▶  Stream Contínuo")
-            self._lbl_status.setText("Stream parado.")
-            self._lbl_status.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+            self._status_msg("Stream parado.", COLORS['text_muted'])
 
     @pyqtSlot()
-    def _poll_next(self):
-        """Envia o request do próximo PID da fila de rodízio."""
-        if not self._poll_order or self._bus is None:
-            return
-        pid = self._poll_order[self._poll_idx % len(self._poll_order)]
-        self._poll_idx += 1
-        can_id, data = build_request(pid, target_ecu=self._target_ecu())
-        ok, msg = self._bus.send(can_id, data, is_extended=False)
-        if ok:
-            self._record_request(pid, can_id, data)
-        else:
-            # Erro de transmissão interrompe o stream e avisa o usuário.
-            self._btn_stream.setChecked(False)
-            self._lbl_status.setText(f"Stream interrompido: {msg}")
-            self._lbl_status.setStyleSheet(f"color: {COLORS['error']}; font-size: 12px;")
+    def _dispatch_next(self):
+        """
+        Despacha o próximo request, respeitando "um pendente por vez".
 
-    # ── Recepção de respostas ────────────────────────────────────────────────
+        Ordem de prioridade: a fila do "Ler uma vez" primeiro, depois o rodízio
+        do stream. Enquanto houver request pendente (e dentro do timeout), não
+        sai nada novo — é isso que mantém o diálogo ISO-TP íntegro.
+        """
+        if self._bus is None or not self._bus.is_connected:
+            return
+        if self._inflight is not None:
+            return                      # ainda esperando resposta
+        now = time.time()
+        gap = self.STREAM_MIN_GAP if self._streaming else self.DISPATCH_MS / 1000.0
+        if now - self._last_sent < gap:
+            return
+
+        if self._queue:
+            item = self._queue.pop(0)
+        elif self._streaming and self._poll_order:
+            item = self._poll_order[self._poll_idx % len(self._poll_order)]
+            self._poll_idx += 1
+        else:
+            return
+
+        can_id, data = self._build_item_request(item, self._target_ecu())
+        ok, msg = self._bus.send(can_id, data, is_extended=False)
+        if not ok:
+            # Falha de transmissão: para tudo e explica. Pode ser listen-only,
+            # barramento fora do ar ou recusa da lista branca de segurança.
+            self._queue.clear()
+            if self._streaming:
+                self._btn_stream.setChecked(False)
+            self._status_msg(f"Transmissão interrompida: {msg}", COLORS['error'])
+            return
+
+        self._last_sent = now
+        self._inflight = {"item": item, "can_id": can_id,
+                          "data": bytes(data), "sent": now}
+        self._isotp.reset()     # nenhuma transferência antiga nos interessa
+        self._record_request(item, can_id, data)
+        self._set_status(item, "consultando...", COLORS['warning'])
+
+    def _send_flow_control(self, resp_id: int, ts: float = 0.0):
+        """
+        Responde o Flow Control de uma transferência multi-frame.
+
+        SÓ envia quando o First Frame pode ser resposta ao NOSSO request: tem
+        que haver request pendente E o quadro tem que ter chegado depois dele.
+        Um First Frame de outro equipamento de diagnóstico não é nosso, e
+        mandar Flow Control nele atropelaria a sessão do outro.
+
+        O FC vai endereçado à ECU que está transmitindo (0x7E0+n), nunca na ID
+        funcional 0x7DF.
+        """
+        if self._inflight is None or ts < self._inflight["sent"]:
+            self._status_msg(
+                f"First Frame de 0x{resp_id:03X} ignorado — não é resposta a "
+                f"um request nosso (provável tráfego de outro equipamento).",
+                COLORS['text_muted'])
+            return
+        fc_id = flow_control_id_for(resp_id)
+        ok, msg = self._bus.send(fc_id, FLOW_CONTROL_CTS, is_extended=False)
+        if ok:
+            self._doc_fc_sent += 1
+        else:
+            self._status_msg(f"Falha ao enviar Flow Control: {msg}",
+                             COLORS['error'])
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Recepção de respostas
+    # ════════════════════════════════════════════════════════════════════════
 
     def on_message(self, msg: CANMessage):
         """
         Chamado da THREAD DO CAN para cada mensagem recebida.
 
-        Faz o mínimo possível: tenta interpretar como resposta OBD-II e, se for,
-        enfileira o resultado. NÃO toca em widgets Qt aqui (isso é feito no
-        _drain_responses, que roda na thread da interface).
+        Faz o mínimo possível: se o quadro está na faixa de resposta de
+        diagnóstico, enfileira uma cópia. NÃO interpreta e NÃO toca em widgets
+        Qt — toda a máquina de estados roda na thread da interface.
         """
         try:
-            result = parse_response(msg.can_id, msg.data)
+            if msg.is_extended:
+                return
+            if not (OBD_RESP_MIN <= msg.can_id <= OBD_RESP_MAX):
+                return
+            # O instante de RECEBIMENTO é guardado junto: é ele que permite
+            # descartar um quadro que chegou ANTES do request atual sair (ver
+            # _handle_payload) e assim não atribuir resposta ao item errado.
+            self._frames.append((msg.can_id, bytes(msg.data), msg.dlc,
+                                 time.time()))
         except Exception:
             return
-        if result is not None:
-            # Guardamos também o quadro CRU e o DLC: a documentação exportada
-            # precisa mostrar os bytes exatos que a ECU colocou no barramento,
-            # não apenas o valor já convertido.
-            result["raw"] = bytes(msg.data)
-            result["dlc"] = msg.dlc
-            self._pending.append(result)
 
     @pyqtSlot()
     def _drain_responses(self):
         """
-        Consome a fila de respostas e atualiza a tabela (thread da GUI).
+        Processa os quadros recebidos e atualiza a tabela (thread da GUI).
 
-        TRATAMENTO DE MÚLTIPLAS ECUs: com request broadcast (0x7DF), vários
-        módulos respondem o MESMO PID com valores próprios. Em vez de deixar a
-        última resposta sobrescrever a célula silenciosamente (o que faria o
-        operador anotar a leitura do módulo errado), registramos todas as
-        origens e sinalizamos o conflito na coluna Fonte e no Status.
+        Todo quadro passa pelo remontador ISO-TP, que trata igualmente Single
+        Frame e multi-frame. Quando um payload fica completo, o primeiro byte
+        diz o que ele é: 0x41 = resposta do modo 01, 0x62 = resposta do $22,
+        0x7F = resposta negativa.
         """
-        while self._pending:
+        now = time.time()
+        while self._frames:
             try:
-                r = self._pending.popleft()
+                can_id, data, dlc, ts = self._frames.popleft()
             except IndexError:
                 break
-            pid = r["pid"]
-            row = self._pid_rows.get(pid)
-            if row is None:
+            try:
+                ev = self._isotp.feed(can_id, data, now)
+            except Exception:
                 continue
-            src = r.get("src")
-            value = r["value"]
 
-            # Registra a ECU de origem deste PID.
-            srcs = self._pid_sources.setdefault(pid, set())
-            if src is not None:
-                srcs.add(src)
+            if ev.kind == "need_fc":
+                self._send_flow_control(can_id, ts)
+            elif ev.kind == "complete":
+                # ev.first_frame é o 1º quadro da resposta (não o último a
+                # chegar): é ele que vai para a documentação como payload RX.
+                self._handle_payload(can_id, ev.payload,
+                                     ev.first_frame or data, ev.frames, ts)
+            elif ev.kind == "error":
+                self._status_msg(f"ISO-TP (0x{can_id:03X}): {ev.detail}",
+                                 COLORS['warning'])
 
-            # Alimenta o registro cumulativo usado pela documentação.
-            self._record_response(r)
+        # Transferências multi-frame que pararam no meio.
+        for src in self._isotp.purge(now):
+            self._status_msg(
+                f"Resposta multi-frame incompleta de 0x{src:03X} — descartada.",
+                COLORS['warning'])
 
-            # Formata: inteiro sem casas, fracionário com 1 casa.
-            txt = f"{value:.0f}" if abs(value - round(value)) < 0.05 else f"{value:.1f}"
-            item = self._table.item(row, self.COL_VALOR)
-            if item:
-                item.setText(txt)
-                item.setForeground(QColor(COLORS['success']))
+        # Request pendente que não recebeu resposta dentro do prazo.
+        if self._inflight and now - self._inflight["sent"] > self.REQ_TIMEOUT:
+            item = self._inflight["item"]
+            self._inflight = None
+            self._doc_timeouts += 1
+            self._set_status(item, "sem resposta", COLORS['text_muted'])
 
-            # Coluna Fonte: qual ECU respondeu (e aviso se houver mais de uma).
-            fonte_item = self._table.item(row, self.COL_FONTE)
-            if fonte_item is not None and src is not None:
-                if len(srcs) > 1:
-                    # Mais de um módulo respondendo o mesmo PID: valores
-                    # distintos estão disputando a mesma célula.
-                    lista = ", ".join(f"0x{s:03X}" for s in sorted(srcs))
-                    fonte_item.setText(f"⚠ {len(srcs)} ECUs: {lista}")
-                    fonte_item.setForeground(QColor(COLORS['warning']))
-                    fonte_item.setToolTip(
-                        "Vários módulos respondem este PID com valores próprios.\n"
-                        "O valor exibido é o da última resposta recebida.\n"
-                        "Escolha uma ECU específica no seletor 'ECU alvo' para\n"
-                        "obter uma leitura sem ambiguidade."
-                    )
-                else:
-                    fonte_item.setText(f"0x{src:03X}")
-                    fonte_item.setForeground(QColor(COLORS['text_muted']))
-                    fonte_item.setToolTip(ecu_name(src))
+    def _handle_payload(self, src: int, payload: bytes,
+                        first_frame: bytes, frames: int, ts: float = 0.0):
+        """
+        Interpreta um payload ISO-TP completo vindo de uma ECU.
 
-            # Status reflete o conflito, se houver.
-            if len(srcs) > 1:
-                self._set_status(pid, "⚠ conflito", COLORS['warning'])
-            else:
-                self._set_status(pid, "OK", COLORS['success'])
+        O parâmetro ts (instante em que o quadro foi recebido) só importa para
+        a resposta NEGATIVA — ver o comentário nesse trecho.
+        """
+        if not payload:
+            return
+        sid = payload[0]
 
-    def _set_status(self, pid: int, text: str, color: str):
-        """Atualiza a coluna Status de um PID."""
-        row = self._pid_rows.get(pid)
+        # ── Resposta do OBD-II modo 01 ───────────────────────────────────────
+        if sid == 0x41:
+            res = decode_mode01_payload(payload)
+            if res is None:
+                return
+            item = (KIND_PID, res["pid"])
+            self._update_item(item, src, res["value"], res["data"],
+                              first_frame, frames)
+            return
+
+        # ── Resposta positiva do UDS $22 ─────────────────────────────────────
+        if sid == 0x62:
+            res = parse_read_did_response(payload)
+            if res is None or res.get("kind") != "positive":
+                return
+            did = res["did"]
+            item = (KIND_DID, did)
+            if item not in self._rows:
+                # DID que não está no nosso banco: registra como desconhecido
+                # em vez de descartar — é informação de campo valiosa.
+                self._status_msg(
+                    f"DID 0x{did:04X} respondeu mas não está no banco do "
+                    f"programa: dados {format_hex(res['data'])}",
+                    COLORS['warning'])
+                return
+            valor, _ = interpret(did, res["data"])
+            self._update_item(item, src, valor, res["data"],
+                              first_frame, frames)
+            return
+
+        # ── Resposta negativa ────────────────────────────────────────────────
+        if sid == 0x7F:
+            res = parse_read_did_response(payload)
+            if res is None or res.get("kind") != "negative":
+                return
+            # A negativa NÃO repete o DID: só sabemos de quem é porque
+            # mantemos um único request pendente por vez.
+            #
+            # E só vale se o quadro chegou DEPOIS do request pendente sair.
+            # Sem essa checagem, uma negativa atrasada (de um request que já
+            # estourou o timeout) seria creditada ao item seguinte — o
+            # operador veria "recusado pela ECU" num DID que nem foi
+            # respondido ainda.
+            if self._inflight is None or ts < self._inflight["sent"]:
+                self._status_msg(
+                    f"Resposta negativa de 0x{src:03X} descartada: chegou fora "
+                    f"da janela do request pendente.", COLORS['text_muted'])
+                return
+            item = self._inflight["item"]
+            nrc = res["nrc"]
+            self._inflight = None
+            self._doc_nrc[item] = {
+                "nrc": nrc, "name": res["nrc_name"], "src": src,
+                "count": self._doc_nrc.get(item, {}).get("count", 0) + 1,
+            }
+            self._set_status(item, f"NRC 0x{nrc:02X}", COLORS['error'])
+            cell = self._table.item(self._rows[item], self.COL_STATUS)
+            if cell is not None:
+                cell.setToolTip(f"Resposta negativa da ECU 0x{src:03X}:\n"
+                                f"{res['nrc_name']}")
+            self._status_msg(
+                f"{self._item_label(item)} {self._item_name(item)}: recusado "
+                f"pela ECU 0x{src:03X} — {res['nrc_name']}", COLORS['error'])
+
+    def _update_item(self, item: tuple, src: int, value,
+                     data: bytes, first_frame: bytes, frames: int):
+        """Atualiza a linha do item com uma resposta positiva e registra tudo."""
+        row = self._rows.get(item)
         if row is None:
             return
-        item = self._table.item(row, self.COL_STATUS)
-        if item:
-            item.setText(text)
-            item.setForeground(QColor(color))
 
-    # ── Registro do tráfego (matéria-prima da documentação) ──────────────────
+        # Encerra o request pendente, se esta resposta é a dele.
+        if self._inflight is not None and self._inflight["item"] == item:
+            self._inflight = None
 
-    def _record_request(self, pid: int, can_id: int, data: bytes):
+        srcs = self._sources.setdefault(item, set())
+        srcs.add(src)
+
+        self._record_response(item, src, value, data, first_frame, frames)
+
+        # Valor: para DID sem escala conhecida mostramos o bruto em decimal,
+        # com "~" quando o número vem de uma hipótese de conversão.
+        cell = self._table.item(row, self.COL_VALOR)
+        if cell is not None:
+            if value is None:
+                cell.setText(str(raw_to_int(data)) if data else "—")
+                cell.setForeground(QColor(COLORS['warning']))
+                cell.setToolTip("Sem escala conhecida — valor BRUTO em decimal.")
+            else:
+                txt = self._fmt_num(value)
+                if item[0] == KIND_DID:
+                    txt = "~" + txt      # sinaliza conversão hipotética
+                    cell.setToolTip(self._item_conversion(item))
+                cell.setText(txt)
+                cell.setForeground(QColor(COLORS['success']))
+
+        # Bytes crus do dado — é o que a montadora pede para validação.
+        bruto = self._table.item(row, self.COL_BRUTO)
+        if bruto is not None:
+            bruto.setText(format_hex(data))
+            if frames > 1:
+                bruto.setToolTip(f"Resposta remontada de {frames} quadros CAN "
+                                 f"(ISO-TP multi-frame).")
+
+        # Coluna Fonte: qual ECU respondeu (e aviso se houver mais de uma).
+        fonte = self._table.item(row, self.COL_FONTE)
+        if fonte is not None:
+            if len(srcs) > 1:
+                lista = ", ".join(f"0x{s:03X}" for s in sorted(srcs))
+                fonte.setText(f"⚠ {len(srcs)} ECUs: {lista}")
+                fonte.setForeground(QColor(COLORS['warning']))
+                fonte.setToolTip(
+                    "Vários módulos respondem este item com valores próprios.\n"
+                    "O valor exibido é o da última resposta recebida.\n"
+                    "Escolha uma ECU específica no seletor 'ECU alvo' para\n"
+                    "obter uma leitura sem ambiguidade.")
+            else:
+                fonte.setText(f"0x{src:03X}")
+                fonte.setForeground(QColor(COLORS['text_muted']))
+                fonte.setToolTip(ecu_name(src))
+
+        if len(srcs) > 1:
+            self._set_status(item, "⚠ conflito", COLORS['warning'])
+        else:
+            self._set_status(item, "OK" if frames == 1 else f"OK ({frames}q)",
+                             COLORS['success'])
+
+    def _set_status(self, item: tuple, text: str, color: str):
+        """Atualiza a coluna Status de um item."""
+        row = self._rows.get(item)
+        if row is None:
+            return
+        cell = self._table.item(row, self.COL_STATUS)
+        if cell:
+            cell.setText(text)
+            cell.setForeground(QColor(color))
+
+    def _status_msg(self, text: str, color: str = None):
+        """Escreve na barra de status da aba."""
+        self._lbl_status.setText(text)
+        self._lbl_status.setStyleSheet(
+            f"color: {color or COLORS['text_muted']}; font-size: 12px;")
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Registro do tráfego (matéria-prima da documentação)
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _record_request(self, item: tuple, can_id: int, data: bytes):
         """
-        Anota um request OBD-II que FOI transmitido com sucesso.
+        Anota um request que FOI transmitido com sucesso.
 
         A chave inclui a ID usada (0x7DF ou 0x7E0+n) porque o operador pode
         trocar de endereçamento no meio da sessão — e a documentação deve
-        mostrar exatamente como cada PID foi perguntado.
+        mostrar exatamente como cada item foi perguntado.
         """
         now = time.time()
         if self._doc_start == 0.0:
-            self._doc_start = now      # marca o início da sessão OBD-II
-        key = (pid, can_id)
+            self._doc_start = now
+        key = (item[0], item[1], can_id)
         rec = self._doc_req.get(key)
         if rec is None:
             self._doc_req[key] = {"count": 1, "data": bytes(data), "first": now}
         else:
             rec["count"] += 1
 
-    def _record_response(self, r: dict):
+    def _record_response(self, item: tuple, src: int, value,
+                         data: bytes, first_frame: bytes, frames: int):
         """
-        Acumula uma resposta decodificada no registro da documentação.
+        Acumula uma resposta no registro da documentação.
 
-        Uma entrada por par (PID, ECU): em broadcast o mesmo PID volta de
+        Uma entrada por (tipo, número, ECU): em broadcast o mesmo item volta de
         módulos diferentes, e cada módulo tem a SUA faixa de valores. Guardamos
-        contagem, mínimo/máximo, último valor e os quadros crus (primeiro e
-        último) para o arquivo exportado.
+        contagem, mínimo/máximo, último valor, os bytes de dado e o primeiro
+        quadro cru — é exatamente o conjunto que a montadora pediu para
+        validação (canal, payload TX, payload RX, resposta obtida).
         """
-        pid = r.get("pid")
-        src = r.get("src")
-        if pid is None or src is None:
-            return
         now = time.time()
-        value = r["value"]
-        raw = r.get("raw", b"")
-        key = (pid, src)
+        key = (item[0], item[1], src)
         rec = self._doc_obs.get(key)
         if rec is None:
             self._doc_obs[key] = {
                 "count": 1, "first": now, "last": now,
                 "min": value, "max": value, "last_value": value,
-                "raw_first": raw, "raw_last": raw,
-                "dlc": r.get("dlc", len(raw)),
-                "name": r.get("name", ""), "unit": r.get("unit", ""),
+                "data": bytes(data), "raw_first": bytes(first_frame),
+                "raw_last": bytes(first_frame), "frames": frames,
+                "name": self._item_name(item), "unit": self._item_unit(item),
             }
         else:
             rec["count"] += 1
             rec["last"] = now
-            rec["min"] = min(rec["min"], value)
-            rec["max"] = max(rec["max"], value)
             rec["last_value"] = value
-            if raw:
-                rec["raw_last"] = raw
+            rec["data"] = bytes(data)
+            rec["raw_last"] = bytes(first_frame)
+            rec["frames"] = frames
+            if value is not None:
+                rec["min"] = value if rec["min"] is None else min(rec["min"], value)
+                rec["max"] = value if rec["max"] is None else max(rec["max"], value)
 
-    # ── Exportação da documentação ───────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    #  Exportação da documentação
+    # ════════════════════════════════════════════════════════════════════════
 
     @staticmethod
     def _hex_bytes(data: bytes) -> str:
@@ -533,8 +843,10 @@ class OBD2Tab(QWidget):
         return " ".join(f"{b:02X}" for b in data) if data else "—"
 
     @staticmethod
-    def _fmt_num(v: float) -> str:
+    def _fmt_num(v) -> str:
         """Número legível: sem casas decimais quando é praticamente inteiro."""
+        if v is None:
+            return "—"
         return f"{v:.0f}" if abs(v - round(v)) < 0.005 else f"{v:.2f}"
 
     @staticmethod
@@ -542,18 +854,28 @@ class OBD2Tab(QWidget):
         """Hora do relógio (HH:MM:SS) a partir de um time.time()."""
         return datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "—"
 
-    def _request_ids_for(self, pid: int) -> str:
-        """IDs de request usadas para um PID (pode haver mais de uma)."""
-        ids = sorted({cid for (p, cid) in self._doc_req if p == pid})
+    def _request_ids_for(self, kind: str, num: int) -> str:
+        """IDs de request usadas para um item (pode haver mais de uma)."""
+        ids = sorted({cid for (k, n, cid) in self._doc_req
+                      if k == kind and n == num})
         return ", ".join(f"0x{c:03X}" for c in ids) if ids else "—"
 
+    def _request_bytes_for(self, kind: str, num: int) -> bytes:
+        """Um exemplo do quadro de request transmitido para o item."""
+        for (k, n, _), rec in self._doc_req.items():
+            if k == kind and n == num:
+                return rec["data"]
+        return b""
+
     def _doc_summary(self) -> list[tuple[str, str]]:
-        """Pares (rótulo, valor) que descrevem a sessão de leitura OBD-II."""
+        """Pares (rótulo, valor) que descrevem a sessão de leitura."""
         total_req = sum(r["count"] for r in self._doc_req.values())
         total_resp = sum(r["count"] for r in self._doc_obs.values())
-        pids_req = {p for (p, _) in self._doc_req}
-        pids_resp = {p for (p, _) in self._doc_obs}
-        ecus = sorted({s for (_, s) in self._doc_obs})
+        itens_req = {(k, n) for (k, n, _) in self._doc_req}
+        itens_resp = {(k, n) for (k, n, _) in self._doc_obs}
+        ecus = sorted({s for (_, _, s) in self._doc_obs})
+        pids_resp = sum(1 for (k, _) in itens_resp if k == KIND_PID)
+        dids_resp = sum(1 for (k, _) in itens_resp if k == KIND_DID)
 
         # Origem dos dados (hardware real, simulação ou nada conectado).
         if self._bus is None or not self._bus.is_connected:
@@ -579,62 +901,88 @@ class OBD2Tab(QWidget):
             dur = f"{secs // 60} min {secs % 60} s"
 
         return [
-            ("Documento", "Protocolo OBD-II observado no barramento"),
+            ("Documento", "Protocolo de diagnóstico observado no barramento"),
             ("Gerado em", datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
-            ("Programa", "IxxatInterface v7 — aba OBD-II"),
-            ("Norma", "SAE J1979 (modo 01) sobre ISO 15765-4 (CAN 11 bits)"),
+            ("Programa", "IxxatInterface v7 — aba OBD-II / UDS"),
+            ("Normas",
+             "SAE J1979 modo 01 (PIDs) e ISO 14229 serviço 0x22 (DIDs), "
+             "sobre ISO 15765-4 (CAN 11 bits)"),
+            ("Canal de diagnóstico",
+             f"request 0x{OBD_REQUEST_FUNCTIONAL:03X} (funcional) / "
+             f"0x{OBD_REQUEST_PHYSICAL_BASE:03X}-"
+             f"0x{OBD_REQUEST_PHYSICAL_BASE + 7:03X} (físico)  →  "
+             f"resposta 0x{OBD_RESP_MIN:03X}-0x{OBD_RESP_MAX:03X}"),
             ("Origem dos dados", fonte),
             ("Modo de transmissão", tx),
             ("ECU alvo selecionada", self._cmb_ecu.currentText()),
             ("Início da leitura", self._fmt_time(self._doc_start)),
             ("Duração da leitura", dur),
-            ("Requests transmitidos", f"{total_req} (em {len(pids_req)} PID(s))"),
+            ("Requests transmitidos",
+             f"{total_req} (em {len(itens_req)} item(ns) distintos)"),
             ("Respostas recebidas", f"{total_resp}"),
-            ("PIDs com resposta", f"{len(pids_resp)}"),
-            ("PIDs sem resposta", f"{len(pids_req - pids_resp)}"),
+            ("PIDs com resposta", f"{pids_resp}"),
+            ("DIDs com resposta", f"{dids_resp}"),
+            ("Itens sem resposta", f"{len(itens_req - itens_resp)}"),
+            ("Respostas negativas (NRC)", f"{len(self._doc_nrc)}"),
+            ("Flow Control transmitidos",
+             f"{self._doc_fc_sent} (respostas multi-frame)"),
+            ("Requests sem resposta no prazo", f"{self._doc_timeouts}"),
             ("ECUs que responderam",
              ", ".join(f"0x{s:03X} ({ecu_name(s)})" for s in ecus) or "—"),
+            ("Serviços transmitidos",
+             "0x01 (OBD-II modo 01) e 0x22 (UDS Read Data By Identifier) — "
+             "ambos de LEITURA"),
             ("Escrita no barramento",
-             "NENHUMA — apenas requests de leitura do modo 01; nenhum dado é "
-             "gravado nas ECUs"),
+             "NENHUMA. O programa não transmite escrita de DID (0x2E), "
+             "atuação (0x2F), rotina (0x31), reset (0x11), apagamento de "
+             "falhas (0x14) nem troca de sessão (0x10/0x3E) — a lista branca "
+             "de transmissão recusa esses serviços no barramento"),
         ]
 
     # Cabeçalhos das tabelas do documento (compartilhados por Excel e TXT).
     DOC_OBS_HEADERS = [
-        "PID (hex)", "PID (dec)", "Parâmetro", "ECU", "Nome da ECU",
-        "Request (ID)", "Request (bytes)", "Resposta (bytes)", "DLC",
-        "Bytes de dados", "Fórmula (A, B = bytes de dados)", "Unidade",
+        "Tipo", "PID/DID", "Nº (dec)", "Sinal", "ECU", "Nome da ECU",
+        "Request (ID)", "Request (bytes)", "Resposta (1º quadro)", "Quadros",
+        "Dados (bruto hex)", "Bruto (dec)", "Conversão", "Unidade",
         "Último valor", "Mínimo", "Máximo", "Respostas",
         "1ª resposta", "Última resposta",
     ]
     DOC_NORESP_HEADERS = [
-        "PID (hex)", "PID (dec)", "Parâmetro", "Request (ID)",
-        "Request (bytes)", "Requests enviados", "Interpretação",
+        "Tipo", "PID/DID", "Nº (dec)", "Sinal", "Request (ID)",
+        "Request (bytes)", "Requests enviados", "Resposta negativa (NRC)",
+        "Interpretação",
     ]
     DOC_DB_HEADERS = [
         "PID (hex)", "PID (dec)", "Parâmetro", "Bytes de dados", "Unidade",
         "Fórmula (A, B = bytes de dados)", "Faixa típica",
         "Request (broadcast)", "Observado nesta sessão",
     ]
+    DOC_DID_HEADERS = [
+        "DID", "Sinal", "Unidade", "Request (bytes)",
+        "Conversão (hipótese)", "Fonte da informação", "Prioritário",
+        "Observado nesta sessão",
+    ]
+    DOC_LIB_HEADERS = ["#", "Linha (enviar ao equipamento)", "Comentário"]
 
     def _rows_observed(self) -> list[list]:
-        """Uma linha por par (PID, ECU) efetivamente observado no barramento."""
+        """Uma linha por (item, ECU) efetivamente observado no barramento."""
         rows = []
-        for (pid, src) in sorted(self._doc_obs.keys()):
-            rec = self._doc_obs[(pid, src)]
-            info = PID_DATABASE.get(pid)
-            n_bytes = info.n_bytes if info else rec["dlc"]
-            # Request cru correspondente (qualquer um deste PID serve como
-            # exemplo do quadro transmitido).
-            req_data = next((r["data"] for (p, _), r in self._doc_req.items()
-                             if p == pid), b"")
+        for key in sorted(self._doc_obs.keys()):
+            kind, num, src = key
+            rec = self._doc_obs[key]
+            item = (kind, num)
+            data = rec.get("data", b"")
             rows.append([
-                f"0x{pid:02X}", pid,
-                rec["name"] or (info.name if info else "—"),
-                f"0x{src:03X}", ecu_name(src),
-                self._request_ids_for(pid), self._hex_bytes(req_data),
-                self._hex_bytes(rec["raw_last"]), rec["dlc"],
-                n_bytes, formula_text(pid), rec["unit"],
+                self._item_service(item), self._item_label(item), num,
+                rec["name"], f"0x{src:03X}", ecu_name(src),
+                self._request_ids_for(kind, num),
+                self._hex_bytes(self._request_bytes_for(kind, num)),
+                self._hex_bytes(rec.get("raw_last", b"")),
+                rec.get("frames", 1),
+                self._hex_bytes(data),
+                raw_to_int(data) if data else "—",
+                self._item_conversion(item).replace("\n", " "),
+                rec["unit"],
                 self._fmt_num(rec["last_value"]),
                 self._fmt_num(rec["min"]), self._fmt_num(rec["max"]),
                 rec["count"],
@@ -643,25 +991,41 @@ class OBD2Tab(QWidget):
         return rows
 
     def _rows_no_response(self) -> list[list]:
-        """PIDs que foram perguntados e NÃO voltaram — sinal de não suportado."""
-        pids_resp = {p for (p, _) in self._doc_obs}
+        """
+        Itens perguntados que NÃO trouxeram valor.
+
+        Distingue dois casos bem diferentes para o relatório: silêncio total
+        (provavelmente não suportado) e recusa explícita da ECU, com o código
+        negativo — que é informação de campo valiosa.
+        """
+        respondidos = {(k, n) for (k, n, _) in self._doc_obs}
         rows = []
-        for pid in sorted({p for (p, _) in self._doc_req} - pids_resp):
-            info = PID_DATABASE.get(pid)
-            req_data = next((r["data"] for (p, _), r in self._doc_req.items()
-                             if p == pid), b"")
-            n = sum(r["count"] for (p, _), r in self._doc_req.items() if p == pid)
+        for (kind, num) in sorted({(k, n) for (k, n, _) in self._doc_req}
+                                  - respondidos):
+            item = (kind, num)
+            n_req = sum(r["count"] for (k, nn, _), r in self._doc_req.items()
+                        if k == kind and nn == num)
+            nrc = self._doc_nrc.get(item)
+            if nrc:
+                nrc_txt = f"7F 22 {nrc['nrc']:02X} — {nrc['name']}"
+                interp = ("A ECU recebeu e RECUSOU a consulta. Veja o código: "
+                          "0x31 = não existe neste módulo; 0x33 = exige acesso "
+                          "de segurança; 0x7F = exigiria sessão estendida.")
+            else:
+                nrc_txt = "—"
+                interp = ("Silêncio total: nenhuma ECU respondeu. Provavelmente "
+                          "não suportado, ou está em outra ECU/canal.")
             rows.append([
-                f"0x{pid:02X}", pid, info.name if info else "—",
-                self._request_ids_for(pid), self._hex_bytes(req_data), n,
-                "Nenhuma ECU respondeu — PID provavelmente não suportado "
-                "por este veículo",
+                self._item_service(item), self._item_label(item), num,
+                self._item_name(item), self._request_ids_for(kind, num),
+                self._hex_bytes(self._request_bytes_for(kind, num)),
+                n_req, nrc_txt, interp,
             ])
         return rows
 
     def _rows_database(self) -> list[list]:
         """Referência completa do banco de PIDs implementado no programa."""
-        pids_resp = {p for (p, _) in self._doc_obs}
+        respondidos = {n for (k, n, _) in self._doc_obs if k == KIND_PID}
         rows = []
         for pid in sorted(PID_DATABASE):
             info = PID_DATABASE[pid]
@@ -672,26 +1036,44 @@ class OBD2Tab(QWidget):
                 f"{self._fmt_num(info.min_val)} a {self._fmt_num(info.max_val)} "
                 f"{info.unit}".strip(),
                 f"0x{OBD_REQUEST_FUNCTIONAL:03X}: {self._hex_bytes(req)}",
-                "sim" if pid in pids_resp else "—",
+                "sim" if pid in respondidos else "—",
             ])
         return rows
 
-    # Cabeçalhos da folha de biblioteca CAN.
-    DOC_LIB_HEADERS = ["#", "Linha (enviar ao equipamento)", "Comentário"]
+    def _rows_did_database(self) -> list[list]:
+        """Referência dos DIDs UDS cadastrados no programa."""
+        respondidos = {n for (k, n, _) in self._doc_obs if k == KIND_DID}
+        rows = []
+        for did in sorted(DID_DATABASE):
+            info = DID_DATABASE[did]
+            _, req = build_read_did_request(did)
+            rows.append([
+                f"0x{did:04X}", info.name, info.unit,
+                f"0x{OBD_REQUEST_FUNCTIONAL:03X}: {self._hex_bytes(req)}",
+                info.hypothesis or "desconhecida",
+                info.source or "—",
+                "sim" if did in PRIORITY_DIDS else "—",
+                "sim" if did in respondidos else "—",
+            ])
+        return rows
 
     def _library_entries(self) -> tuple[list[tuple[int, int, bool]], bool]:
         """
         Escolhe quais PIDs entram na biblioteca CAN.
 
-        Preferimos os pares (PID, ECU) que REALMENTE responderam — é a prova de
-        que aquele PID existe no veículo e de qual módulo vem a resposta. Se
-        nada respondeu ainda, caímos nos PIDs marcados na tabela, assumindo a
-        ECU 1 (0x7E8), e sinalizamos que são não confirmados.
+        SÓ PIDs: as linhas VOBD/VS do equipamento descrevem consulta de PID
+        OBD-II. DIDs UDS não têm representação nesse formato, então ficam de
+        fora — gerar linha inválida seria pior que omitir.
+
+        Preferimos os PIDs que REALMENTE responderam; se nada respondeu,
+        caímos nos PIDs marcados na tabela, assumindo a ECU 1 (0x7E8), e
+        sinalizamos que não estão confirmados.
 
         Devolve (entradas, confirmadas).
         """
-        if self._doc_obs:
-            return [(pid, src, True) for (pid, src) in sorted(self._doc_obs)], True
+        obs = [(n, src) for (k, n, src) in sorted(self._doc_obs) if k == KIND_PID]
+        if obs:
+            return [(n, src, True) for (n, src) in obs], True
         return [(pid, OBD_RESP_MIN, False) for pid in self._active_pids()], False
 
     def _rows_library(self) -> list[list]:
@@ -708,22 +1090,22 @@ class OBD2Tab(QWidget):
     @pyqtSlot()
     def _export_doc(self):
         """
-        Gera o arquivo de documentação do protocolo OBD-II desta sessão.
+        Gera o arquivo de documentação do protocolo desta sessão.
 
         O formato é escolhido pela extensão no diálogo de salvamento:
-          .xlsx → planilha com 5 abas (resumo, observados, sem resposta,
-                  referência do protocolo e banco de PIDs);
+          .xlsx → planilha com 7 abas (resumo, observados, sem resposta,
+                  biblioteca CAN, protocolo, banco de PIDs, banco de DIDs);
           .txt  → mesmo conteúdo em texto puro (não depende do openpyxl).
         """
-        # Sem tráfego registrado o arquivo seria apenas a referência da norma;
+        # Sem tráfego registrado o arquivo seria apenas a referência das normas;
         # confirmamos com o usuário para não gerar um documento vazio por engano.
         if not self._doc_req:
             resp = QMessageBox.question(
                 self, "Nenhuma leitura registrada",
-                "Nenhum request OBD-II foi transmitido nesta sessão, então não "
-                "há tráfego observado para documentar.\n\n"
-                "Deseja exportar apenas a referência do protocolo e o banco de "
-                "PIDs do programa?",
+                "Nenhum request foi transmitido nesta sessão, então não há "
+                "tráfego observado para documentar.\n\n"
+                "Deseja exportar apenas a referência dos protocolos e os bancos "
+                "de PIDs/DIDs do programa?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
             if resp != QMessageBox.Yes:
@@ -738,7 +1120,7 @@ class OBD2Tab(QWidget):
             self._doc_model = modelo.strip()
 
         # Sugere a pasta Documents/IxxatInterface (mesma dos logs de sessão).
-        nome = f"protocolo_obd2_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        nome = f"protocolo_diagnostico_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         try:
             os.makedirs(DOC_DIR, exist_ok=True)
             sugerido = os.path.join(DOC_DIR, nome)
@@ -746,7 +1128,7 @@ class OBD2Tab(QWidget):
             sugerido = nome
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Exportar Documentação OBD-II", sugerido,
+            self, "Exportar Documentação de Diagnóstico", sugerido,
             "Excel (*.xlsx);;Texto (*.txt)"
         )
         if not path:
@@ -775,14 +1157,14 @@ class OBD2Tab(QWidget):
             QMessageBox.critical(self, "Erro ao exportar", str(e))
             return
 
-        obs = len(self._doc_obs)
         QMessageBox.information(
             self, "Documentação gerada",
             f"Arquivo salvo em:\n{path}\n\n"
-            f"{obs} par(es) PID/ECU documentado(s) a partir do tráfego real.")
+            f"{len(self._doc_obs)} par(es) item/ECU documentado(s) e "
+            f"{len(self._doc_nrc)} resposta(s) negativa(s) registrada(s).")
 
     def _write_doc_xlsx(self, path: str):
-        """Escreve a documentação como planilha Excel de 5 abas."""
+        """Escreve a documentação como planilha Excel."""
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
@@ -807,7 +1189,7 @@ class OBD2Tab(QWidget):
 
         def tabela(ws, headers: list, rows: list, start_row: int,
                    widths: list = None):
-            """Escreve cabeçalho + linhas com borda e zebra; devolve a próxima linha."""
+            """Cabeçalho + linhas com borda e zebra; devolve a próxima linha."""
             for c, h in enumerate(headers, start=1):
                 cell = ws.cell(row=start_row, column=c, value=h)
                 cell.fill, cell.font = hdr_fill, bold
@@ -832,8 +1214,8 @@ class OBD2Tab(QWidget):
         # ── Aba 1: Resumo da sessão ──────────────────────────────────────────
         ws = wb.active
         ws.title = "Resumo"
-        titulo(ws, "DOCUMENTAÇÃO DO PROTOCOLO OBD-II — RESUMO DA SESSÃO", 2)
-        ws.column_dimensions["A"].width = 26
+        titulo(ws, "DOCUMENTAÇÃO DO DIAGNÓSTICO — RESUMO DA SESSÃO", 2)
+        ws.column_dimensions["A"].width = 30
         ws.column_dimensions["B"].width = 95
         r = 3
         for label, value in self._doc_summary():
@@ -844,19 +1226,19 @@ class OBD2Tab(QWidget):
             r += 1
 
         # ── Aba 2: tráfego observado ─────────────────────────────────────────
-        ws = wb.create_sheet("PIDs Observados")
-        titulo(ws, "PIDs RESPONDIDOS PELO VEÍCULO (tráfego real capturado)",
-               len(self.DOC_OBS_HEADERS))
+        ws = wb.create_sheet("Sinais Observados")
+        titulo(ws, "PIDs e DIDs RESPONDIDOS PELO VEÍCULO "
+                   "(tráfego real capturado)", len(self.DOC_OBS_HEADERS))
         tabela(ws, self.DOC_OBS_HEADERS, self._rows_observed(), 3,
-               widths=[10, 9, 30, 8, 24, 14, 26, 26, 6, 8, 30, 9,
+               widths=[8, 12, 9, 30, 8, 24, 14, 26, 26, 8, 22, 12, 34, 9,
                        13, 10, 10, 10, 12, 14])
 
-        # ── Aba 3: PIDs sem resposta ─────────────────────────────────────────
+        # ── Aba 3: consultados sem valor ─────────────────────────────────────
         ws = wb.create_sheet("Sem Resposta")
-        titulo(ws, "PIDs CONSULTADOS SEM RESPOSTA (não suportados)",
+        titulo(ws, "CONSULTADOS SEM VALOR (silêncio ou recusa da ECU)",
                len(self.DOC_NORESP_HEADERS))
         tabela(ws, self.DOC_NORESP_HEADERS, self._rows_no_response(), 3,
-               widths=[10, 9, 32, 14, 26, 16, 60])
+               widths=[8, 12, 9, 32, 14, 26, 16, 34, 70])
 
         # ── Aba 4: biblioteca CAN pronta para o equipamento ──────────────────
         ws = wb.create_sheet("Biblioteca CAN")
@@ -870,6 +1252,9 @@ class OBD2Tab(QWidget):
                 "ATENÇÃO: nenhum PID respondeu nesta sessão — as linhas abaixo "
                 "usam os PIDs MARCADOS na tabela e assumem a ECU 1 (0x7E8). "
                 "Confirme fazendo uma leitura antes de aplicar no equipamento.")
+        nota += (" Esta folha cobre apenas PIDs OBD-II: as linhas VOBD/VS do "
+                 "equipamento não representam consulta UDS $22, então os DIDs "
+                 "não entram aqui (veja a folha 'Banco de DIDs').")
         if len(entries) > LIB_MAX_FILTERS:
             nota += (f" Apenas os {LIB_MAX_FILTERS} primeiros sinais entraram: "
                      f"o equipamento só tem {LIB_MAX_FILTERS} filtros "
@@ -877,7 +1262,7 @@ class OBD2Tab(QWidget):
         c = ws.cell(row=2, column=1, value=nota)
         c.alignment = wrap
         ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=3)
-        ws.row_dimensions[2].height = 30
+        ws.row_dimensions[2].height = 44
         prox = tabela(ws, self.DOC_LIB_HEADERS, self._rows_library(), 4,
                       widths=[5, 46, 92])
         # Legenda campo a campo do filtro VS, logo abaixo das linhas.
@@ -892,19 +1277,27 @@ class OBD2Tab(QWidget):
                [["", campo, texto] for campo, texto in VS_FIELD_DOC], prox + 1)
         ws.freeze_panes = None
 
-        # ── Aba 5: referência do protocolo ───────────────────────────────────
+        # ── Aba 5: referência dos protocolos ─────────────────────────────────
         ws = wb.create_sheet("Protocolo")
-        titulo(ws, "COMO O DIÁLOGO OBD-II FUNCIONA (referência da norma)", 2)
-        ws.column_dimensions["A"].width = 24
-        ws.column_dimensions["B"].width = 100
+        titulo(ws, "COMO O DIÁLOGO DE DIAGNÓSTICO FUNCIONA "
+                   "(referência das normas)", 3)
+        ws.column_dimensions["A"].width = 14
+        ws.column_dimensions["B"].width = 24
+        ws.column_dimensions["C"].width = 96
         r = 3
-        for topico, texto in PROTOCOL_NOTES:
-            a = ws.cell(row=r, column=1, value=topico)
-            a.fill, a.font, a.border, a.alignment = hdr_fill, bold, border, left
-            b = ws.cell(row=r, column=2, value=texto)
-            b.border, b.alignment = border, wrap
-            ws.row_dimensions[r].height = 32
-            r += 1
+        for servico, notas in (("OBD-II 01", PROTOCOL_NOTES),
+                               ("UDS $22", UDS_PROTOCOL_NOTES)):
+            for topico, texto in notas:
+                a = ws.cell(row=r, column=1, value=servico)
+                a.fill, a.font, a.border, a.alignment = (hdr_fill, bold,
+                                                         border, left)
+                b = ws.cell(row=r, column=2, value=topico)
+                b.fill, b.font, b.border, b.alignment = (hdr_fill, bold,
+                                                         border, left)
+                c = ws.cell(row=r, column=3, value=texto)
+                c.border, c.alignment = border, wrap
+                ws.row_dimensions[r].height = 32
+                r += 1
         # Tabela de IDs de resposta por módulo.
         r += 1
         ecu_rows = [[f"0x{rid:03X}", nome,
@@ -914,12 +1307,28 @@ class OBD2Tab(QWidget):
                ecu_rows, r)
         ws.freeze_panes = None
 
-        # ── Aba 6: banco de PIDs do programa ─────────────────────────────────
+        # ── Aba 6: banco de PIDs ─────────────────────────────────────────────
         ws = wb.create_sheet("Banco de PIDs")
         titulo(ws, "PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modo 01)",
                len(self.DOC_DB_HEADERS))
         tabela(ws, self.DOC_DB_HEADERS, self._rows_database(), 3,
                widths=[10, 9, 32, 8, 9, 30, 22, 34, 12])
+
+        # ── Aba 7: banco de DIDs ─────────────────────────────────────────────
+        ws = wb.create_sheet("Banco de DIDs")
+        titulo(ws, "DIDs IMPLEMENTADOS NO PROGRAMA (UDS $22)",
+               len(self.DOC_DID_HEADERS))
+        c = ws.cell(row=2, column=1,
+                    value="As conversões abaixo são HIPÓTESES: a montadora "
+                          "informou a unidade, não a escala. Confirme com "
+                          "leitura real — o valor bruto está na folha "
+                          "'Sinais Observados'.")
+        c.alignment = wrap
+        ws.merge_cells(start_row=2, start_column=1, end_row=2,
+                       end_column=len(self.DOC_DID_HEADERS))
+        ws.row_dimensions[2].height = 30
+        tabela(ws, self.DOC_DID_HEADERS, self._rows_did_database(), 4,
+               widths=[10, 34, 9, 30, 30, 18, 12, 12])
 
         wb.save(path)
 
@@ -932,28 +1341,47 @@ class OBD2Tab(QWidget):
             cols = [[str(h)] + [str(r[i]) for r in rows]
                     for i, h in enumerate(headers)]
             larg = [min(max(len(v) for v in col), 44) for col in cols]
+
             def linha(vals):
                 return "  " + " | ".join(
                     str(v)[:w].ljust(w) for v, w in zip(vals, larg))
+
             out = [linha(headers), "  " + "-+-".join("-" * w for w in larg)]
             out += [linha(r) for r in rows]
             return out
 
+        def paragrafo(texto: str, recuo: str = "      ",
+                      largura: int = 86) -> list[str]:
+            """Quebra um texto longo em linhas, para o arquivo ficar legível."""
+            out, atual = [], ""
+            for p in texto.split():
+                if len(atual) + len(p) + 1 > largura:
+                    out.append(recuo + atual)
+                    atual = p
+                else:
+                    atual = f"{atual} {p}".strip()
+            if atual:
+                out.append(recuo + atual)
+            return out
+
         L: list[str] = []
         L.append("=" * 100)
-        L.append("DOCUMENTAÇÃO DO PROTOCOLO OBD-II — IxxatInterface v7")
+        L.append("DOCUMENTAÇÃO DO DIAGNÓSTICO (OBD-II modo 01 + UDS $22) — "
+                 "IxxatInterface v7")
         L.append("=" * 100)
         L.append("")
         L.append("1) RESUMO DA SESSÃO")
         L.append("-" * 100)
         for label, value in self._doc_summary():
-            L.append(f"  {label + ':':<24} {value}")
+            L.append(f"  {label + ':':<32} {value[:64]}")
+            if len(value) > 64:
+                L += paragrafo(value[64:], recuo=" " * 35)
         L.append("")
-        L.append("2) PIDs RESPONDIDOS PELO VEÍCULO (tráfego real capturado)")
+        L.append("2) PIDs e DIDs RESPONDIDOS PELO VEÍCULO (tráfego real)")
         L.append("-" * 100)
         L += tabela(self.DOC_OBS_HEADERS, self._rows_observed())
         L.append("")
-        L.append("3) PIDs CONSULTADOS SEM RESPOSTA (não suportados)")
+        L.append("3) CONSULTADOS SEM VALOR (silêncio ou recusa da ECU)")
         L.append("-" * 100)
         L += tabela(self.DOC_NORESP_HEADERS, self._rows_no_response())
         L.append("")
@@ -964,6 +1392,8 @@ class OBD2Tab(QWidget):
             L.append("  ATENÇÃO: nenhum PID respondeu nesta sessão. As linhas abaixo usam os")
             L.append("  PIDs MARCADOS na tabela e assumem a ECU 1 (0x7E8) — confirme com uma")
             L.append("  leitura antes de aplicar no equipamento.")
+        L.append("  OBS: esta seção cobre apenas PIDs OBD-II; DIDs UDS não têm")
+        L.append("  representação no formato VOBD/VS do equipamento.")
         if len(entries) > LIB_MAX_FILTERS:
             L.append(f"  OBS: só os {LIB_MAX_FILTERS} primeiros sinais entraram "
                      f"(limite de filtros do equipamento).")
@@ -978,20 +1408,15 @@ class OBD2Tab(QWidget):
         for campo, texto in VS_FIELD_DOC:
             L.append(f"    {campo:<10} {texto}")
         L.append("")
-        L.append("5) COMO O DIÁLOGO OBD-II FUNCIONA (referência da norma)")
+        L.append("5) COMO O DIÁLOGO DE DIAGNÓSTICO FUNCIONA (normas)")
         L.append("-" * 100)
-        for topico, texto in PROTOCOL_NOTES:
-            L.append(f"  • {topico}:")
-            # Quebra o texto em linhas de ~86 colunas para o arquivo ficar legível.
-            palavras, atual = texto.split(), ""
-            for p in palavras:
-                if len(atual) + len(p) + 1 > 86:
-                    L.append(f"      {atual}")
-                    atual = p
-                else:
-                    atual = f"{atual} {p}".strip()
-            if atual:
-                L.append(f"      {atual}")
+        for servico, notas in (("OBD-II modo 01 (SAE J1979)", PROTOCOL_NOTES),
+                               ("UDS $22 (ISO 14229)", UDS_PROTOCOL_NOTES)):
+            L.append("")
+            L.append(f"  ### {servico}")
+            for topico, texto in notas:
+                L.append(f"  • {topico}:")
+                L += paragrafo(texto)
         L.append("")
         L.append("  IDs de resposta por módulo:")
         L += tabela(["ID de resposta", "Módulo", "ID de request físico"],
@@ -1003,10 +1428,19 @@ class OBD2Tab(QWidget):
         L.append("-" * 100)
         L += tabela(self.DOC_DB_HEADERS, self._rows_database())
         L.append("")
+        L.append("7) DIDs IMPLEMENTADOS NO PROGRAMA (UDS $22)")
+        L.append("-" * 100)
+        L.append("  As conversões são HIPÓTESES: a montadora informou a unidade,")
+        L.append("  não a escala. Confirme com leitura real (valor bruto na seção 2).")
+        L.append("")
+        L += tabela(self.DOC_DID_HEADERS, self._rows_did_database())
+        L.append("")
         L.append("=" * 100)
-        L.append(f"Faixa de IDs OBD-II: request 0x{OBD_REQUEST_FUNCTIONAL:03X} / "
+        L.append(f"Canal de diagnóstico: request 0x{OBD_REQUEST_FUNCTIONAL:03X} / "
                  f"0x{OBD_REQUEST_PHYSICAL_BASE:03X}-0x{OBD_REQUEST_PHYSICAL_BASE + 7:03X}"
                  f"  |  resposta 0x{OBD_RESP_MIN:03X}-0x{OBD_RESP_MAX:03X}")
+        L.append("Serviços transmitidos: 0x01 (OBD-II modo 01) e 0x22 (UDS "
+                 "leitura de DID) — somente leitura.")
         L.append("=" * 100)
 
         with open(path, "w", encoding="utf-8") as f:

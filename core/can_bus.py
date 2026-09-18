@@ -34,6 +34,47 @@ except ImportError:
     CAN_AVAILABLE = False
 
 
+# ── POLÍTICA DE TRANSMISSÃO (segurança) ─────────────────────────────────────
+# O programa é um analisador passivo, com UMA exceção: as consultas de
+# diagnóstico, que só funcionam se transmitirmos o request. Estas três
+# estruturas definem, em um único lugar, o que pode sair pelo barramento.
+# Ver CANBus.tx_policy_check() para o porquê de cada regra.
+
+# IDs de request de diagnóstico em CAN 11 bits (ISO 15765-4).
+TX_ALLOWED_IDS = {0x7DF} | set(range(0x7E0, 0x7E8))
+
+# Serviços de LEITURA permitidos. Nada aqui altera estado de ECU.
+TX_ALLOWED_SERVICES = {
+    0x01,   # OBD-II modo 01 — dados atuais (SAE J1979)
+    0x22,   # UDS Read Data By Identifier (ISO 14229)
+}
+
+# Serviços explicitamente recusados, com o motivo mostrado ao operador. Serve
+# de documentação do perigo e melhora a mensagem de erro quando alguém tenta.
+TX_FORBIDDEN_HINTS = {
+    0x02: "freeze frame — não implementado",
+    0x03: "leitura de DTC — não implementado",
+    0x04: "APAGA DTCs e dados de prontidão",
+    0x10: "troca a sessão de diagnóstico — pode degradar o veículo",
+    0x11: "REINICIA a ECU",
+    0x14: "APAGA informações de diagnóstico",
+    0x19: "leitura de DTC — não implementado",
+    0x23: "lê memória por endereço — não implementado",
+    0x27: "acesso de segurança (seed-key)",
+    0x28: "suprime a comunicação normal do barramento",
+    0x2E: "ESCREVE em DID",
+    0x2F: "ACIONA atuador (entrada/saída)",
+    0x31: "DISPARA rotina na ECU",
+    0x34: "inicia download de firmware",
+    0x35: "inicia upload de firmware",
+    0x36: "transfere dados de firmware",
+    0x37: "encerra transferência de firmware",
+    0x3D: "ESCREVE memória por endereço",
+    0x3E: "tester present — manteria sessão não-default ativa",
+    0x85: "desliga a gravação de falhas",
+}
+
+
 @dataclass
 class CANMessage:
     """
@@ -109,6 +150,9 @@ class CANBus:
         # (relatórios/exportações precisam registrar canal e baudrate usados).
         self._channel = 0
         self._bitrate = 0
+        # Resposta multi-frame simulada aguardando o nosso Flow Control:
+        # (id_de_resposta, [quadros consecutivos]) ou None.
+        self._sim_mf_pending = None
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -229,25 +273,100 @@ class CANBus:
         """True se a conexão atual está em modo passivo (não transmite)."""
         return self._listen_only
 
+    @staticmethod
+    def tx_policy_check(can_id: int, data: bytes,
+                        is_extended: bool = False) -> tuple[bool, str]:
+        """
+        LISTA BRANCA DE TRANSMISSÃO — a trava de segurança do programa.
+
+        Este programa é um ANALISADOR: a única transmissão legítima são
+        CONSULTAS DE LEITURA de diagnóstico. Em vez de confiar que o resto do
+        código "só vai mandar leitura", esta função recusa no portão qualquer
+        quadro fora da política — inclusive um enviado por engano de
+        programação.
+
+        O motivo é concreto: os serviços destrutivos ficam a um dígito de
+        distância dos que usamos. 0x22 (ler DID) x 0x2E (ESCREVER DID) têm o
+        MESMO formato de request; 0x2F aciona atuador, 0x31 dispara rotina,
+        0x11 reinicia a ECU, 0x14 apaga falhas, 0x10 troca a sessão de
+        diagnóstico (o que pode degradar o veículo). Um byte trocado seria
+        suficiente para sair de "ler" e cair em "agir".
+
+        Só passam:
+          • IDs de request de diagnóstico em 11 bits (0x7DF, 0x7E0..0x7E7);
+          • Single Frame ISO-TP cujo serviço esteja em TX_ALLOWED_SERVICES
+            (0x01 = OBD-II modo 01, 0x22 = UDS leitura de DID);
+          • Flow Control "clear to send" (0x30 0x00 ...), que é transporte
+            puro, obrigatório para receber respostas multi-frame e não carrega
+            serviço nenhum.
+
+        Retorna (permitido, motivo). O motivo é exibido ao operador.
+        """
+        if is_extended:
+            return False, ("Transmissão recusada: só são permitidas IDs de "
+                           "diagnóstico de 11 bits.")
+        if can_id not in TX_ALLOWED_IDS:
+            return False, (f"Transmissão recusada: ID 0x{can_id:03X} não é uma "
+                           "ID de request de diagnóstico "
+                           "(0x7DF ou 0x7E0..0x7E7).")
+        if len(data) < 2:
+            return False, "Transmissão recusada: quadro sem serviço."
+
+        pci = data[0] >> 4
+
+        # Flow Control (0x30 = clear to send). Transporte, sem serviço.
+        if data[0] == 0x30:
+            if len(data) < 3 or data[1] != 0x00:
+                return False, ("Transmissão recusada: Flow Control aceito "
+                               "apenas como 'clear to send' (30 00 ...).")
+            return True, "ok"
+
+        # Daqui para baixo só Single Frame: nunca transmitimos multi-frame.
+        if pci != 0x0:
+            return False, ("Transmissão recusada: o programa só envia quadros "
+                           "Single Frame (requests de leitura).")
+        length = data[0] & 0x0F
+        if length < 2:
+            return False, "Transmissão recusada: comprimento ISO-TP inválido."
+
+        sid = data[1]
+        if sid not in TX_ALLOWED_SERVICES:
+            return False, (
+                f"Transmissão recusada pela política de segurança: serviço "
+                f"0x{sid:02X} não permitido "
+                f"({TX_FORBIDDEN_HINTS.get(sid, 'não é serviço de leitura')}).\n"
+                "O programa só transmite leituras: 0x01 (OBD-II modo 01) e "
+                "0x22 (UDS Read Data By Identifier).")
+        return True, "ok"
+
     def send(self, can_id: int, data: bytes, is_extended: bool = False) -> tuple[bool, str]:
         """
         Transmite um quadro CAN no barramento.
 
-        Usado pela leitura OBD-II (que é pergunta/resposta: precisa ENVIAR o
-        request para a ECU responder). NÃO funciona em modo listen-only, pois o
-        controlador está configurado como 100% passivo.
+        Usado pela leitura OBD-II e UDS $22 (protocolos de pergunta/resposta:
+        precisam ENVIAR o request para a ECU responder). NÃO funciona em modo
+        listen-only, pois o controlador está configurado como 100% passivo.
 
-        Em modo SIMULAÇÃO, gera uma resposta OBD-II sintética e a injeta de volta
-        nos listeners, permitindo testar a aba OBD2 sem hardware.
+        Todo quadro passa primeiro pela lista branca tx_policy_check() — a
+        verificação vem ANTES do desvio de simulação, para que a política seja
+        idêntica com e sem hardware.
+
+        Em modo SIMULAÇÃO, gera uma resposta sintética e a injeta de volta nos
+        listeners, permitindo testar as leituras sem hardware.
 
         Retorna (sucesso, mensagem).
         """
         if not self._running:
             return False, "Não conectado ao barramento."
 
-        # Simulação: fabrica uma resposta OBD-II fake para o request enviado.
+        # Trava de segurança: só leituras de diagnóstico saem daqui.
+        permitido, motivo = self.tx_policy_check(can_id, bytes(data), is_extended)
+        if not permitido:
+            return False, motivo
+
+        # Simulação: fabrica uma resposta fake (OBD-II ou UDS) para o request.
         if self._simulation:
-            self._sim_obd2_response(can_id, bytes(data), is_extended)
+            self._sim_diag_response(can_id, bytes(data), is_extended)
             return True, "ok (simulação)"
 
         # Hardware real: precisa NÃO estar em listen-only.
@@ -263,6 +382,108 @@ class CANBus:
             return True, "ok"
         except Exception as e:
             return False, str(e)
+
+    def _sim_diag_response(self, req_id: int, data: bytes, is_extended: bool):
+        """
+        Roteia um request de diagnóstico simulado para o gerador certo.
+
+        Três casos:
+          serviço 0x01 → resposta OBD-II modo 01 (_sim_obd2_response);
+          serviço 0x22 → resposta UDS Read Data By Identifier (_sim_uds_response);
+          quadro 0x30  → Flow Control: libera os Consecutive Frames de uma
+                         resposta multi-frame que ficou pendente.
+        """
+        if len(data) < 2:
+            return
+        if data[0] == 0x30:              # Flow Control do "testador" (nós)
+            self._sim_flush_multiframe()
+            return
+        sid = data[1]
+        if sid == 0x01:
+            self._sim_obd2_response(req_id, data, is_extended)
+        elif sid == 0x22:
+            self._sim_uds_response(req_id, data)
+
+    def _sim_uds_response(self, req_id: int, data: bytes):
+        """
+        Gera uma resposta simulada do serviço UDS $22 para um DID.
+
+        Reproduz o diálogo real, inclusive os dois casos que a aba precisa
+        tratar:
+          • DID conhecido e curto → Single Frame (05 62 01 01 xx yy);
+          • DID de acelerações (0xB005) → resposta de 9 bytes, que NÃO cabe num
+            quadro: sai First Frame e os Consecutive Frames só são enviados
+            depois que o programa mandar o Flow Control;
+          • DID desconhecido → resposta negativa 7F 22 31 (fora de faixa).
+        """
+        if len(data) < 4:
+            return
+        did = (data[2] << 8) | data[3]
+        s = self._sim_state
+
+        # Bytes de dado de cada DID, derivados do estado do simulador. As
+        # escalas seguem as HIPÓTESES documentadas em core/uds.py.
+        dados = None
+        if did == 0x0101:      # rotação: bruto = rpm × 4 (2 bytes)
+            raw = int(max(0, s._rpm) * 4)
+            dados = [(raw >> 8) & 0xFF, raw & 0xFF]
+        elif did == 0xD001:    # KL15: ignição ligada
+            dados = [0x01]
+        elif did == 0xE101:    # odômetro: bruto = km × 10 (4 bytes)
+            raw = int(max(0, s._odometer) * 10)
+            dados = [(raw >> 24) & 0xFF, (raw >> 16) & 0xFF,
+                     (raw >> 8) & 0xFF, raw & 0xFF]
+        elif did == 0x0116:    # pedal do acelerador (% → 0..255)
+            dados = [int(max(0, min(255, s._throttle * 255 / 100)))]
+        elif did == 0x018B:    # pedal de embreagem (0 ou 100%)
+            dados = [255 if s._clutch else 0]
+        elif did == 0x1009:    # temperatura do motor: bruto = °C + 40
+            dados = [int(max(0, min(255, s._coolant_temp + 40)))]
+        elif did == 0xB003:    # temperatura do ar: 28 °C
+            dados = [28 + 40]
+        elif did == 0x1615:    # nível de AdBlue (~65%)
+            dados = [int(65 * 255 / 100)]
+        elif did == 0xB005:    # acelerações: 6 bytes → força multi-frame
+            dados = [0x00, 0x64, 0x01, 0x00, 0x32, 0x02]
+        if dados is None:
+            # DID inexistente: resposta negativa, igual ao veículo real.
+            self._sim_emit(0x7E8, [0x03, 0x7F, 0x22, 0x31])
+            return
+
+        payload = [0x62, (did >> 8) & 0xFF, did & 0xFF] + dados
+        if len(payload) <= 7:
+            # Cabe num Single Frame.
+            self._sim_emit(0x7E8, [len(payload)] + payload)
+            return
+
+        # Multi-frame: First Frame com o total e os 6 primeiros bytes; o resto
+        # fica guardado esperando o nosso Flow Control.
+        total = len(payload)
+        ff = [0x10 | ((total >> 8) & 0x0F), total & 0xFF] + payload[:6]
+        self._sim_emit(0x7E8, ff)
+        restante = payload[6:]
+        quadros, seq = [], 1
+        while restante:
+            bloco, restante = restante[:7], restante[7:]
+            quadros.append([0x20 | (seq & 0x0F)] + bloco)
+            seq += 1
+        self._sim_mf_pending = (0x7E8, quadros)
+
+    def _sim_flush_multiframe(self):
+        """Envia os Consecutive Frames pendentes após receber o Flow Control."""
+        pend = getattr(self, "_sim_mf_pending", None)
+        if not pend:
+            return
+        resp_id, quadros = pend
+        self._sim_mf_pending = None
+        for q in quadros:
+            self._sim_emit(resp_id, q)
+
+    def _sim_emit(self, can_id: int, raw: list):
+        """Injeta um quadro simulado nos listeners, com padding para 8 bytes."""
+        dados = list(raw) + [0x00] * (8 - len(raw))
+        self._dispatch(CANMessage(time.time(), can_id, bytes(dados[:8]),
+                                  False, 8))
 
     def _sim_obd2_response(self, req_id: int, data: bytes, is_extended: bool):
         """

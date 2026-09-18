@@ -570,11 +570,12 @@ class MainWindow(QMainWindow):
         self._signals_tab.set_bus(self._bus)
         self._tabs.addTab(self._signals_tab, "📋  Sinais Mapeados")
 
-        # Aba 4 — OBD-II: leitura ATIVA de PIDs (pergunta/resposta). Diferente
-        # das demais abas, esta TRANSMITE requests, então exige listen-only OFF.
+        # Aba 4 — OBD-II / UDS: leitura ATIVA de PIDs (modo 01) e DIDs ($22),
+        # ambos pergunta/resposta. Diferente das demais abas, esta TRANSMITE
+        # requests de leitura, então exige listen-only OFF.
         self._obd2_tab = OBD2Tab()
         self._obd2_tab.set_bus(self._bus)
-        self._tabs.addTab(self._obd2_tab, "🔌  OBD-II")
+        self._tabs.addTab(self._obd2_tab, "🔌  OBD-II / UDS")
 
         # Aba 5 — Banco J1939 (tabela estática) e Aba 6 — Sobre (texto informativo).
         self._tabs.addTab(self._build_pgn_tab(), "📖  Banco J1939")
@@ -668,18 +669,24 @@ class MainWindow(QMainWindow):
             "  • Não envia ACK frames nem error frames\n"
             "  • Apenas escuta o tráfego existente\n"
             "  • Seguro para conectar em veículos em operação\n\n"
-            "🔌  EXCEÇÃO — ABA OBD-II\n"
-            "O OBD-II é um protocolo de pergunta/resposta: a ECU só responde se\n"
-            "receber um request. Por isso, APENAS a aba OBD-II transmite, e ela\n"
-            "exige que o Listen-Only esteja DESMARCADO. As demais abas (Monitor,\n"
-            "Descoberta) continuam totalmente passivas.\n\n"
+            "🔌  EXCEÇÃO — ABA OBD-II / UDS\n"
+            "Diagnóstico é pergunta/resposta: a ECU só responde se receber um\n"
+            "request. Por isso, APENAS essa aba transmite, e ela exige que o\n"
+            "Listen-Only esteja DESMARCADO. As demais abas (Monitor, Descoberta)\n"
+            "continuam totalmente passivas.\n"
+            "Só saem do programa dois serviços, ambos de LEITURA: 0x01 (OBD-II\n"
+            "modo 01) e 0x22 (UDS Read Data By Identifier). Uma lista branca no\n"
+            "barramento recusa qualquer outro — escrita de DID (0x2E), atuação\n"
+            "(0x2F), rotina (0x31), reset (0x11), apagar falhas (0x14) e troca\n"
+            "de sessão (0x10/0x3E) não são transmitidos em nenhuma hipótese.\n\n"
             "Funcionalidades:\n"
             "  • Monitor CAN em tempo real com decodificação J1939 FMS v05\n"
             "  • Descoberta guiada de 22 sinais (RPM, velocidade, freio, etc.)\n"
             "  • Detecção automática de sinais 1-byte e 2-byte (LE/BE)\n"
             "  • Suporte a CAN 11-bit proprietário e 29-bit J1939\n"
             "  • Leitura de PIDs OBD-II (SAE J1979, modo 01) com stream contínuo\n"
-            "  • Documentação do protocolo OBD-II observado (Excel/TXT)\n"
+            "  • Leitura de DIDs UDS $22 (ISO 14229) com ISO-TP multi-frame\n"
+            "  • Documentação do protocolo observado (Excel/TXT)\n"
             "  • Calibração de 2 pontos para sinais proprietários\n"
             "  • Exportação Excel formato VIRLOC + Relatório PDF\n"
             "  • Replay de logs CSV da IXXAT miniMon\n"
