@@ -216,17 +216,25 @@ class OBD2Tab(QWidget):
         ecu_row = QHBoxLayout()
         ecu_row.addWidget(QLabel("ECU alvo:"))
         self._cmb_ecu = QComboBox()
+        # Cada módulo tem DUAS IDs: uma onde escuta (0x7E0+n) e outra onde
+        # responde (0x7E8+n). O rótulo mostra as duas porque a coluna "Fonte"
+        # exibe a de resposta — sem isso o operador vê 0x7E8 na tabela, não
+        # encontra esse número no seletor e conclui que é outra ECU.
         self._cmb_ecu.addItem("Todas as ECUs (broadcast 0x7DF)", None)
         for n in range(8):
             self._cmb_ecu.addItem(
-                f"Somente ECU {n + 1} (0x{0x7E0 + n:03X})", n)
+                f"Somente ECU {n + 1}  (pergunta 0x{0x7E0 + n:03X} → "
+                f"responde 0x{OBD_RESP_MIN + n:03X})", n)
         self._cmb_ecu.setToolTip(
             "Broadcast: todas as ECUs respondem — o MESMO PID/DID pode voltar\n"
             "com valores diferentes de módulos diferentes (a coluna Fonte\n"
             "mostra a origem e avisa quando há conflito).\n"
-            "ECU específica: só aquele módulo responde, sem ambiguidade."
+            "ECU específica: só aquele módulo responde, sem ambiguidade.\n\n"
+            "As duas IDs são do MESMO módulo: ele escuta em 0x7E0+n e responde\n"
+            "em 0x7E8+n. Por isso a coluna Fonte mostra 0x7E8 quando você\n"
+            "consulta a ECU 1."
         )
-        self._cmb_ecu.setMinimumWidth(260)
+        self._cmb_ecu.setMinimumWidth(360)
         ecu_row.addWidget(self._cmb_ecu)
         ecu_row.addStretch()
         layout.addLayout(ecu_row)
@@ -345,6 +353,18 @@ class OBD2Tab(QWidget):
     # ════════════════════════════════════════════════════════════════════════
     #  Helpers de item (PID ou DID)
     # ════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _ecu_label(resp_id: int) -> str:
+        """
+        Nome curto do módulo a partir da ID de RESPOSTA.
+
+        0x7E8 → "ECU 1", 0x7E9 → "ECU 2" … A numeração é a mesma usada no
+        seletor "ECU alvo", que fala em IDs de pergunta (0x7E0+n).
+        """
+        if OBD_RESP_MIN <= resp_id <= OBD_RESP_MAX:
+            return f"ECU {resp_id - OBD_RESP_MIN + 1}"
+        return f"0x{resp_id:03X}"
 
     @staticmethod
     def _item_service(item: tuple) -> str:
@@ -786,8 +806,9 @@ class OBD2Tab(QWidget):
         fonte = self._table.item(row, self.COL_FONTE)
         if fonte is not None:
             if len(srcs) > 1:
-                lista = ", ".join(f"0x{s:03X}" for s in sorted(srcs))
-                fonte.setText(f"⚠ {len(srcs)} ECUs: {lista}")
+                lista = ", ".join(f"{self._ecu_label(s)} (0x{s:03X})"
+                                  for s in sorted(srcs))
+                fonte.setText(f"⚠ {len(srcs)} módulos: {lista}")
                 fonte.setForeground(QColor(COLORS['warning']))
                 fonte.setToolTip(
                     "Vários módulos respondem este item com valores próprios.\n"
@@ -795,9 +816,16 @@ class OBD2Tab(QWidget):
                     "Escolha uma ECU específica no seletor 'ECU alvo' para\n"
                     "obter uma leitura sem ambiguidade.")
             else:
-                fonte.setText(f"0x{src:03X}")
+                # Mostra o número DO MÓDULO junto da ID de resposta: o
+                # seletor "ECU alvo" fala em ECU 1..8, a resposta chega em
+                # 0x7E8+n, e sem relacionar os dois o operador não liga uma
+                # coisa à outra.
+                fonte.setText(f"{self._ecu_label(src)} · 0x{src:03X}")
                 fonte.setForeground(QColor(COLORS['text_muted']))
-                fonte.setToolTip(ecu_name(src))
+                fonte.setToolTip(
+                    f"{ecu_name(src)}\n"
+                    f"Escuta em 0x{OBD_REQUEST_PHYSICAL_BASE + (src - OBD_RESP_MIN):03X}, "
+                    f"responde em 0x{src:03X} — é o mesmo módulo.")
 
         if len(srcs) > 1:
             self._set_status(item, "⚠ conflito", COLORS['warning'])
