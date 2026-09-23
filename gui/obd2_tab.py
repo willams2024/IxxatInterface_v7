@@ -54,15 +54,17 @@ from PyQt5.QtWidgets import (
 
 from core.can_bus import CANMessage
 from core.obd2 import (
-    PID_DATABASE, ECU_NAMES, PROTOCOL_NOTES, VS_FIELD_DOC, LIB_MAX_FILTERS,
-    OBD_REQUEST_FUNCTIONAL, OBD_REQUEST_PHYSICAL_BASE, OBD_RESP_MIN,
-    OBD_RESP_MAX, build_request, decode_mode01_payload, ecu_name,
-    formula_text, build_can_library,
+    PID_DATABASE, MODE9_PIDS, ECU_NAMES, PROTOCOL_NOTES, VS_FIELD_DOC,
+    LIB_MAX_FILTERS, OBD_REQUEST_FUNCTIONAL, OBD_REQUEST_PHYSICAL_BASE,
+    OBD_RESP_MIN, OBD_RESP_MAX, RESP_MODE_09, build_request,
+    build_mode09_request, decode_mode01_payload, decode_mode09_payload,
+    ecu_name, formula_text, build_can_library,
 )
 from core.uds import (
-    DID_DATABASE, PRIORITY_DIDS, UDS_PROTOCOL_NOTES, FLOW_CONTROL_CTS,
-    IsoTpReader, build_read_did_request, parse_read_did_response,
-    flow_control_id_for, interpret, raw_to_int, format_hex, nrc_name,
+    DID_DATABASE, PRIORITY_DIDS, TEXT_DIDS, UDS_PROTOCOL_NOTES,
+    FLOW_CONTROL_CTS, IsoTpReader, build_read_did_request,
+    parse_read_did_response, flow_control_id_for, interpret, raw_to_int,
+    format_hex, nrc_name,
 )
 from gui.styles import COLORS
 
@@ -71,13 +73,16 @@ from gui.styles import COLORS
 DOC_DIR = os.path.join(os.path.expanduser("~"), "Documents", "IxxatInterface")
 
 # Tipos de item da tabela. Um item é a tupla (KIND, número):
-#   ("pid", 0x0C)   → OBD-II modo 01, PID 0x0C
-#   ("did", 0x0101) → UDS $22, DID 0x0101
+#   ("pid",  0x0C)   → OBD-II modo 01, PID 0x0C     (dados atuais)
+#   ("pid9", 0x02)   → OBD-II modo 09, PID 0x02     (informações do veículo)
+#   ("did",  0x0101) → UDS $22, DID 0x0101          (proprietário)
 KIND_PID = "pid"
+KIND_PID9 = "pid9"
 KIND_DID = "did"
 
 # PIDs e DIDs já marcados ao abrir o programa: os mais usados do OBD-II mais
-# os sinais que a montadora marcou como prioritários.
+# os sinais que a montadora marcou como prioritários. O chassi (modo 09 e DID
+# 0xF190) vem marcado porque identifica o veículo de toda a coleta.
 DEFAULT_PIDS = (0x0C, 0x0D, 0x05, 0x11)
 
 
@@ -291,6 +296,7 @@ class OBD2Tab(QWidget):
         self._rows.clear()
 
         itens = ([(KIND_PID, pid) for pid in sorted(PID_DATABASE)]
+                 + [(KIND_PID9, pid) for pid in sorted(MODE9_PIDS)]
                  + [(KIND_DID, did) for did in sorted(DID_DATABASE)])
 
         for item in itens:
@@ -303,8 +309,11 @@ class OBD2Tab(QWidget):
             chk = QCheckBox()
             if kind == KIND_PID:
                 chk.setChecked(num in DEFAULT_PIDS)
+            elif kind == KIND_PID9:
+                chk.setChecked(True)          # chassi: sempre útil na coleta
             else:
-                chk.setChecked(num in PRIORITY_DIDS)
+                # Prioritários da montadora + o chassi padronizado (0xF190).
+                chk.setChecked(num in PRIORITY_DIDS or num in TEXT_DIDS)
             holder = QWidget()
             hl = QHBoxLayout(holder)
             hl.addWidget(chk)
@@ -340,7 +349,7 @@ class OBD2Tab(QWidget):
     @staticmethod
     def _item_service(item: tuple) -> str:
         """Serviço usado pelo item, como aparece na coluna 'Tipo'."""
-        return "PID 01" if item[0] == KIND_PID else "DID 22"
+        return {KIND_PID: "PID 01", KIND_PID9: "PID 09"}.get(item[0], "DID 22")
 
     @staticmethod
     def _item_label(item: tuple) -> str:
@@ -352,17 +361,27 @@ class OBD2Tab(QWidget):
         montadora documenta.
         """
         kind, num = item
-        return f"0x{num:02X} ({num})" if kind == KIND_PID else f"0x{num:04X}"
+        if kind == KIND_DID:
+            return f"0x{num:04X}"
+        return f"0x{num:02X} ({num})"
 
     @staticmethod
     def _item_name(item: tuple) -> str:
         kind, num = item
-        info = PID_DATABASE.get(num) if kind == KIND_PID else DID_DATABASE.get(num)
+        if kind == KIND_PID:
+            info = PID_DATABASE.get(num)
+            return info.name if info else "—"
+        if kind == KIND_PID9:
+            info = MODE9_PIDS.get(num)
+            return info[0] if info else "—"
+        info = DID_DATABASE.get(num)
         return info.name if info else "—"
 
     @staticmethod
     def _item_unit(item: tuple) -> str:
         kind, num = item
+        if kind == KIND_PID9:
+            return ""                     # informação do veículo é texto
         info = PID_DATABASE.get(num) if kind == KIND_PID else DID_DATABASE.get(num)
         return (info.unit if info else "") or ""
 
@@ -371,16 +390,22 @@ class OBD2Tab(QWidget):
         """
         Texto da conversão do item.
 
-        Para PID é a fórmula da norma (valor confiável). Para DID é a hipótese
-        registrada em core/uds.py — e o texto diz isso, porque a montadora não
-        informou as escalas.
+        Para PID do modo 01 é a fórmula da norma (valor confiável); para o
+        modo 09 é texto ASCII; para DID é a hipótese registrada em
+        core/uds.py — e o texto diz isso, porque a montadora não informou as
+        escalas dos DIDs proprietários.
         """
         kind, num = item
         if kind == KIND_PID:
             return f"SAE J1979: {formula_text(num)}"
+        if kind == KIND_PID9:
+            return "SAE J1979 modo 09: texto ASCII (sem conversão numérica)"
         info = DID_DATABASE.get(num)
         if info is None:
             return "—"
+        if info.kind == "ascii":
+            return (f"ISO 14229-1: {info.hypothesis or 'texto ASCII'} "
+                    f"(sem conversão numérica)")
         return (f"UDS $22 — conversão: {info.hypothesis or 'desconhecida'}"
                 f"\nEscala não informada pela montadora: confira o valor bruto.")
 
@@ -389,6 +414,8 @@ class OBD2Tab(QWidget):
         kind, num = item
         if kind == KIND_PID:
             return build_request(num, target_ecu=target)
+        if kind == KIND_PID9:
+            return build_mode09_request(num, target_ecu=target)
         return build_read_did_request(num, target_ecu=target)
 
     # ── Seleção na tabela ────────────────────────────────────────────────────
@@ -645,6 +672,17 @@ class OBD2Tab(QWidget):
                               first_frame, frames)
             return
 
+        # ── Resposta do OBD-II modo 09 (informações do veículo) ──────────────
+        if sid == RESP_MODE_09:
+            res = decode_mode09_payload(payload)
+            if res is None:
+                return
+            item = (KIND_PID9, res["pid"])
+            # O valor aqui é TEXTO (ex.: o chassi), não número.
+            self._update_item(item, src, res["value"], res["data"],
+                              first_frame, frames)
+            return
+
         # ── Resposta positiva do UDS $22 ─────────────────────────────────────
         if sid == 0x62:
             res = parse_read_did_response(payload)
@@ -716,10 +754,15 @@ class OBD2Tab(QWidget):
         self._record_response(item, src, value, data, first_frame, frames)
 
         # Valor: para DID sem escala conhecida mostramos o bruto em decimal,
-        # com "~" quando o número vem de uma hipótese de conversão.
+        # com "~" quando o número vem de uma hipótese de conversão. Itens de
+        # TEXTO (chassi) exibem a string decodificada como está.
         cell = self._table.item(row, self.COL_VALOR)
         if cell is not None:
-            if value is None:
+            if isinstance(value, str):
+                cell.setText(value or "—")
+                cell.setForeground(QColor(COLORS['success']))
+                cell.setToolTip(self._item_conversion(item))
+            elif value is None:
                 cell.setText(str(raw_to_int(data)) if data else "—")
                 cell.setForeground(QColor(COLORS['warning']))
                 cell.setToolTip("Sem escala conhecida — valor BRUTO em decimal.")
@@ -813,11 +856,15 @@ class OBD2Tab(QWidget):
         """
         now = time.time()
         key = (item[0], item[1], src)
+        # Texto (chassi) não tem mínimo/máximo — as colunas ficam vazias no
+        # relatório em vez de repetir a string três vezes.
+        num = value if (isinstance(value, (int, float))
+                        and not isinstance(value, bool)) else None
         rec = self._doc_obs.get(key)
         if rec is None:
             self._doc_obs[key] = {
                 "count": 1, "first": now, "last": now,
-                "min": value, "max": value, "last_value": value,
+                "min": num, "max": num, "last_value": value,
                 "data": bytes(data), "raw_first": bytes(first_frame),
                 "raw_last": bytes(first_frame), "frames": frames,
                 "name": self._item_name(item), "unit": self._item_unit(item),
@@ -829,9 +876,14 @@ class OBD2Tab(QWidget):
             rec["data"] = bytes(data)
             rec["raw_last"] = bytes(first_frame)
             rec["frames"] = frames
-            if value is not None:
-                rec["min"] = value if rec["min"] is None else min(rec["min"], value)
-                rec["max"] = value if rec["max"] is None else max(rec["max"], value)
+            # Mínimo/máximo só fazem sentido para número: um chassi não tem
+            # faixa, e comparar strings aqui produziria lixo no relatório.
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if isinstance(rec["min"], (int, float)):
+                    rec["min"] = min(rec["min"], value)
+                    rec["max"] = max(rec["max"], value)
+                else:
+                    rec["min"] = rec["max"] = value
 
     # ════════════════════════════════════════════════════════════════════════
     #  Exportação da documentação
@@ -844,9 +896,16 @@ class OBD2Tab(QWidget):
 
     @staticmethod
     def _fmt_num(v) -> str:
-        """Número legível: sem casas decimais quando é praticamente inteiro."""
+        """
+        Número legível: sem casas decimais quando é praticamente inteiro.
+
+        Valores de TEXTO (chassi) passam direto — a mesma célula do relatório
+        recebe tanto número quanto string.
+        """
         if v is None:
             return "—"
+        if isinstance(v, str):
+            return v or "—"
         return f"{v:.0f}" if abs(v - round(v)) < 0.005 else f"{v:.2f}"
 
     @staticmethod
@@ -930,8 +989,8 @@ class OBD2Tab(QWidget):
             ("ECUs que responderam",
              ", ".join(f"0x{s:03X} ({ecu_name(s)})" for s in ecus) or "—"),
             ("Serviços transmitidos",
-             "0x01 (OBD-II modo 01) e 0x22 (UDS Read Data By Identifier) — "
-             "ambos de LEITURA"),
+             "0x01 (OBD-II modo 01), 0x09 (OBD-II informações do veículo) e "
+             "0x22 (UDS Read Data By Identifier) — todos de LEITURA"),
             ("Escrita no barramento",
              "NENHUMA. O programa não transmite escrita de DID (0x2E), "
              "atuação (0x2F), rotina (0x31), reset (0x11), apagamento de "
@@ -953,8 +1012,8 @@ class OBD2Tab(QWidget):
         "Interpretação",
     ]
     DOC_DB_HEADERS = [
-        "PID (hex)", "PID (dec)", "Parâmetro", "Bytes de dados", "Unidade",
-        "Fórmula (A, B = bytes de dados)", "Faixa típica",
+        "Modo", "PID (hex)", "PID (dec)", "Parâmetro", "Bytes de dados",
+        "Unidade", "Fórmula (A, B = bytes de dados)", "Faixa típica",
         "Request (broadcast)", "Observado nesta sessão",
     ]
     DOC_DID_HEADERS = [
@@ -980,7 +1039,10 @@ class OBD2Tab(QWidget):
                 self._hex_bytes(rec.get("raw_last", b"")),
                 rec.get("frames", 1),
                 self._hex_bytes(data),
-                raw_to_int(data) if data else "—",
+                # "Bruto (dec)" não faz sentido para texto: o inteiro de um
+                # chassi de 17 bytes seria um número de 41 dígitos.
+                ("—" if isinstance(rec["last_value"], str)
+                 else (raw_to_int(data) if data else "—")),
                 self._item_conversion(item).replace("\n", " "),
                 rec["unit"],
                 self._fmt_num(rec["last_value"]),
@@ -1024,19 +1086,34 @@ class OBD2Tab(QWidget):
         return rows
 
     def _rows_database(self) -> list[list]:
-        """Referência completa do banco de PIDs implementado no programa."""
-        respondidos = {n for (k, n, _) in self._doc_obs if k == KIND_PID}
+        """
+        Referência do banco de PIDs implementado no programa.
+
+        Inclui os dois serviços de leitura do OBD-II: modo 01 (dados atuais,
+        numéricos) e modo 09 (informações do veículo, em texto).
+        """
+        resp_01 = {n for (k, n, _) in self._doc_obs if k == KIND_PID}
+        resp_09 = {n for (k, n, _) in self._doc_obs if k == KIND_PID9}
         rows = []
         for pid in sorted(PID_DATABASE):
             info = PID_DATABASE[pid]
             _, req = build_request(pid)     # exemplo com ID funcional (0x7DF)
             rows.append([
-                f"0x{pid:02X}", pid, info.name, info.n_bytes, info.unit,
+                "01", f"0x{pid:02X}", pid, info.name, info.n_bytes, info.unit,
                 formula_text(pid),
                 f"{self._fmt_num(info.min_val)} a {self._fmt_num(info.max_val)} "
                 f"{info.unit}".strip(),
                 f"0x{OBD_REQUEST_FUNCTIONAL:03X}: {self._hex_bytes(req)}",
-                "sim" if pid in respondidos else "—",
+                "sim" if pid in resp_01 else "—",
+            ])
+        for pid in sorted(MODE9_PIDS):
+            nome, tipo = MODE9_PIDS[pid]
+            _, req = build_mode09_request(pid)
+            rows.append([
+                "09", f"0x{pid:02X}", pid, nome, "17 (texto)", "",
+                "texto ASCII — sem conversão numérica", "—",
+                f"0x{OBD_REQUEST_FUNCTIONAL:03X}: {self._hex_bytes(req)}",
+                "sim" if pid in resp_09 else "—",
             ])
         return rows
 
@@ -1309,10 +1386,11 @@ class OBD2Tab(QWidget):
 
         # ── Aba 6: banco de PIDs ─────────────────────────────────────────────
         ws = wb.create_sheet("Banco de PIDs")
-        titulo(ws, "PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modo 01)",
+        titulo(ws, "PIDs IMPLEMENTADOS NO PROGRAMA "
+                   "(SAE J1979 — modo 01 e modo 09)",
                len(self.DOC_DB_HEADERS))
         tabela(ws, self.DOC_DB_HEADERS, self._rows_database(), 3,
-               widths=[10, 9, 32, 8, 9, 30, 22, 34, 12])
+               widths=[7, 10, 9, 32, 12, 9, 30, 22, 34, 12])
 
         # ── Aba 7: banco de DIDs ─────────────────────────────────────────────
         ws = wb.create_sheet("Banco de DIDs")
@@ -1424,7 +1502,7 @@ class OBD2Tab(QWidget):
                       f"0x{OBD_REQUEST_PHYSICAL_BASE + (rid - OBD_RESP_MIN):03X}"]
                      for rid, nome in sorted(ECU_NAMES.items())])
         L.append("")
-        L.append("6) PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modo 01)")
+        L.append("6) PIDs IMPLEMENTADOS NO PROGRAMA (SAE J1979 — modos 01 e 09)")
         L.append("-" * 100)
         L += tabela(self.DOC_DB_HEADERS, self._rows_database())
         L.append("")

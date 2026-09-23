@@ -46,6 +46,7 @@ TX_ALLOWED_IDS = {0x7DF} | set(range(0x7E0, 0x7E8))
 # Serviços de LEITURA permitidos. Nada aqui altera estado de ECU.
 TX_ALLOWED_SERVICES = {
     0x01,   # OBD-II modo 01 — dados atuais (SAE J1979)
+    0x09,   # OBD-II modo 09 — informações do veículo (chassi/VIN, Cal ID)
     0x22,   # UDS Read Data By Identifier (ISO 14229)
 }
 
@@ -295,7 +296,8 @@ class CANBus:
         Só passam:
           • IDs de request de diagnóstico em 11 bits (0x7DF, 0x7E0..0x7E7);
           • Single Frame ISO-TP cujo serviço esteja em TX_ALLOWED_SERVICES
-            (0x01 = OBD-II modo 01, 0x22 = UDS leitura de DID);
+            (0x01 = OBD-II modo 01, 0x09 = OBD-II informações do veículo,
+            0x22 = UDS leitura de DID);
           • Flow Control "clear to send" (0x30 0x00 ...), que é transporte
             puro, obrigatório para receber respostas multi-frame e não carrega
             serviço nenhum.
@@ -335,8 +337,9 @@ class CANBus:
                 f"Transmissão recusada pela política de segurança: serviço "
                 f"0x{sid:02X} não permitido "
                 f"({TX_FORBIDDEN_HINTS.get(sid, 'não é serviço de leitura')}).\n"
-                "O programa só transmite leituras: 0x01 (OBD-II modo 01) e "
-                "0x22 (UDS Read Data By Identifier).")
+                "O programa só transmite leituras: 0x01 (OBD-II modo 01), "
+                "0x09 (informações do veículo) e 0x22 (UDS Read Data By "
+                "Identifier).")
         return True, "ok"
 
     def send(self, can_id: int, data: bytes, is_extended: bool = False) -> tuple[bool, str]:
@@ -401,8 +404,28 @@ class CANBus:
         sid = data[1]
         if sid == 0x01:
             self._sim_obd2_response(req_id, data, is_extended)
+        elif sid == 0x09:
+            self._sim_mode09_response(req_id, data)
         elif sid == 0x22:
             self._sim_uds_response(req_id, data)
+
+    def _sim_mode09_response(self, req_id: int, data: bytes):
+        """
+        Responde o MODO 09 (informações do veículo) na simulação.
+
+        O VIN tem 17 caracteres, então o payload `49 02 01 + 17` soma 20 bytes
+        e NÃO cabe num quadro — a resposta sai multi-frame de propósito, para
+        exercitar o mesmo caminho do veículo real (First Frame, espera do
+        nosso Flow Control, Consecutive Frames).
+        """
+        if len(data) < 3:
+            return
+        pid = data[2]
+        if pid != 0x02:          # só o VIN está implementado na simulação
+            self._sim_emit(0x7E8, [0x03, 0x7F, 0x09, 0x12])   # sub-função não suportada
+            return
+        payload = [0x49, 0x02, 0x01] + [ord(c) for c in self._sim_state._vin]
+        self._sim_emit_isotp(0x7E8, payload)
 
     def _sim_uds_response(self, req_id: int, data: bytes):
         """
@@ -445,29 +468,36 @@ class CANBus:
             dados = [int(65 * 255 / 100)]
         elif did == 0xB005:    # acelerações: 6 bytes → força multi-frame
             dados = [0x00, 0x64, 0x01, 0x00, 0x32, 0x02]
+        elif did == 0xF190:    # chassi (VIN): 17 caracteres ASCII
+            dados = [ord(c) for c in s._vin]
         if dados is None:
             # DID inexistente: resposta negativa, igual ao veículo real.
             self._sim_emit(0x7E8, [0x03, 0x7F, 0x22, 0x31])
             return
 
-        payload = [0x62, (did >> 8) & 0xFF, did & 0xFF] + dados
-        if len(payload) <= 7:
-            # Cabe num Single Frame.
-            self._sim_emit(0x7E8, [len(payload)] + payload)
-            return
+        self._sim_emit_isotp(0x7E8, [0x62, (did >> 8) & 0xFF, did & 0xFF] + dados)
 
-        # Multi-frame: First Frame com o total e os 6 primeiros bytes; o resto
-        # fica guardado esperando o nosso Flow Control.
+    def _sim_emit_isotp(self, resp_id: int, payload: list):
+        """
+        Emite um payload simulado pelo transporte ISO-TP.
+
+        Até 7 bytes sai num Single Frame; acima disso sai o First Frame e os
+        Consecutive Frames ficam guardados em _sim_mf_pending, aguardando o
+        Flow Control do programa — exatamente o diálogo do veículo real.
+        """
+        if len(payload) <= 7:
+            self._sim_emit(resp_id, [len(payload)] + list(payload))
+            return
         total = len(payload)
-        ff = [0x10 | ((total >> 8) & 0x0F), total & 0xFF] + payload[:6]
-        self._sim_emit(0x7E8, ff)
-        restante = payload[6:]
-        quadros, seq = [], 1
+        # First Frame: nibble 1 + comprimento total em 12 bits + 6 bytes.
+        self._sim_emit(resp_id,
+                       [0x10 | ((total >> 8) & 0x0F), total & 0xFF] + payload[:6])
+        restante, quadros, seq = list(payload[6:]), [], 1
         while restante:
             bloco, restante = restante[:7], restante[7:]
             quadros.append([0x20 | (seq & 0x0F)] + bloco)
-            seq += 1
-        self._sim_mf_pending = (0x7E8, quadros)
+            seq = (seq + 1) & 0x0F      # sequência rola de 15 para 0
+        self._sim_mf_pending = (resp_id, quadros)
 
     def _sim_flush_multiframe(self):
         """Envia os Consecutive Frames pendentes após receber o Flow Control."""
@@ -935,6 +965,10 @@ class _SimState:
         self._clutch = 0             # embreagem (0 = solta, 1 = pressionada)
         self._gear = 0        # marcha atual; codificação J1939 usa offset -125 (neutro)
         self._odometer = 12345.0     # hodômetro em km (valor inicial arbitrário)
+        # Chassi simulado: 17 caracteres no formato real de um VIN brasileiro
+        # (WMI 9BW = Volkswagen do Brasil). Usado pelo modo 09 PID 02 e pelo
+        # DID 0xF190 do UDS.
+        self._vin = "9BWZZZ377VT004251"
         self._coolant_temp = 85.0    # temperatura do líquido de arrefecimento em °C
 
         # Flags de injeção de teste — quando ligadas, sobrescrevem o estado

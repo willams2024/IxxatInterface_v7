@@ -183,6 +183,12 @@ PROTOCOL_NOTES: list[tuple[str, str]] = [
      "Quando a ECU não suporta o PID ela responde 0x7F (serviço não "
      "suportado) ou simplesmente não responde. PIDs sem resposta aparecem na "
      "seção 'PIDs sem resposta' desta documentação."),
+    ("Modo 09 — informações do veículo",
+     "Serviço de leitura separado do modo 01, onde fica o CHASSI (VIN) no "
+     "PID 0x02. Request 02 09 02; resposta 49 02 01 seguida de 17 bytes ASCII. "
+     "Por passar de 7 bytes, a resposta vem multi-frame e exige Flow Control. "
+     "O chassi também pode ser lido por UDS no DID 0xF190 — consultar os dois "
+     "e comparar é a forma segura, porque nem todo veículo atende ambos."),
     ("Impacto no barramento",
      "Esta é a ÚNICA função do programa que transmite no barramento: um "
      "quadro de request por PID consultado. Nenhum dado é escrito nas ECUs "
@@ -214,6 +220,84 @@ def build_request(pid: int, target_ecu: Optional[int] = None) -> tuple[int, byte
         can_id = OBD_REQUEST_PHYSICAL_BASE + (int(target_ecu) & 0x07)
     data = bytes([0x02, 0x01, pid & 0xFF, 0x55, 0x55, 0x55, 0x55, 0x55])
     return can_id, data
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MODO 09 — INFORMAÇÕES DO VEÍCULO (chassi, Cal ID, nome da ECU)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# O modo 09 é o outro serviço de LEITURA do OBD-II legislado. É onde vive o
+# CHASSI (VIN), que o modo 01 não cobre.
+#
+# Diferença prática em relação ao modo 01: a resposta é TEXTO e quase sempre
+# MULTI-FRAME — o VIN tem 17 caracteres e o payload total fica em 20 bytes,
+# bem acima dos 7 que cabem num quadro. Sem remontagem ISO-TP (IsoTpReader em
+# core/uds.py) o chassi nunca aparece.
+#
+#   Request:   02 09 02 55 55 55 55 55
+#   Resposta:  49 02 01 <17 bytes ASCII>
+#              │  │  └── NODI: quantidade de itens de dado (1)
+#              │  └── PID do modo 09
+#              └── 0x49 = 0x09 + 0x40
+#
+# Por que ler o VIN dos dois jeitos (modo 09 e DID 0xF190 do UDS): nem todo
+# veículo responde os dois. Caminhão costuma atender o UDS; veículo leve
+# legislado atende o modo 09. Consultar os dois e comparar é o caminho
+# seguro — inclusive porque, quando ambos respondem, o valor tem que bater.
+
+MODE_09 = 0x09
+RESP_MODE_09 = 0x49          # 0x09 + 0x40
+
+MODE9_PIDS: dict[int, tuple[str, str]] = {
+    # PID: (nome, tipo)
+    0x02: ("Chassi (VIN)", "ascii"),
+}
+
+
+def build_mode09_request(pid: int,
+                         target_ecu: Optional[int] = None) -> tuple[int, bytes]:
+    """
+    Monta o request do MODO 09 (informações do veículo).
+
+    Mesma forma do modo 01, mudando só o byte de serviço:
+    [0x02, 0x09, PID, preenchimento].
+    """
+    if target_ecu is None:
+        can_id = OBD_REQUEST_FUNCTIONAL
+    else:
+        can_id = OBD_REQUEST_PHYSICAL_BASE + (int(target_ecu) & 0x07)
+    data = bytes([0x02, MODE_09, pid & 0xFF, 0x55, 0x55, 0x55, 0x55, 0x55])
+    return can_id, data
+
+
+def decode_mode09_payload(payload: bytes) -> Optional[dict]:
+    """
+    Decodifica o payload ISO-TP já remontado de uma resposta do modo 09:
+    [0x49, PID, NODI, dados...].
+
+    Retorna {pid, value, name, data} — com `value` em TEXTO — ou None.
+
+    O byte NODI (number of data items) vem logo após o PID e vale 1 para o
+    VIN. Ele é descartado: o que interessa são os bytes ASCII seguintes.
+    """
+    if len(payload) < 3:
+        return None
+    if payload[0] != RESP_MODE_09:
+        return None
+    pid = payload[1]
+    info = MODE9_PIDS.get(pid)
+    if info is None:
+        return None
+    nome, tipo = info
+    dados = bytes(payload[3:])        # pula 0x49, PID e NODI
+    if not dados:
+        return None
+    if tipo == "ascii":
+        from core.uds import decode_ascii
+        valor = decode_ascii(dados)
+    else:
+        valor = dados.hex().upper()
+    return {"pid": pid, "value": valor, "name": nome, "data": dados}
 
 
 def decode_mode01_payload(payload: bytes) -> Optional[dict]:

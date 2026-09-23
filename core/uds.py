@@ -115,6 +115,13 @@ class DID:
                      mostra o valor BRUTO junto.
       hypothesis ... rótulo legível da hipótese (aparece na interface).
       source ....... de onde veio a informação do DID.
+      kind ......... natureza do dado:
+                       "num"   — número (o caso comum: rotação, temperatura…)
+                       "ascii" — TEXTO em ASCII, como o chassi (VIN) e os
+                                 números de série/peça. Texto não tem escala
+                                 nem faixa: converter para inteiro seria
+                                 absurdo, então a interface e a documentação
+                                 exibem a string decodificada.
     """
     did: int
     name: str
@@ -124,6 +131,7 @@ class DID:
     offset: float = 0.0
     hypothesis: str = ""
     source: str = ""
+    kind: str = "num"
 
 
 # ── Banco de DIDs ───────────────────────────────────────────────────────────
@@ -154,7 +162,17 @@ DID_DATABASE: dict[int, DID] = {
                 "status (0/1)", "VWCO"),
     0xE101: DID(0xE101, "Odômetro", "km", None, 0.1, 0.0,
                 "÷ 10 (hipótese)", "VWCO"),
+
+    # ── DIDs de identificação padronizados (ISO 14229-1, Anexo C) ───────────
+    # Estes NÃO são proprietários: a norma fixa o identificador e o formato,
+    # então valem em qualquer ECU que implemente UDS — diferente dos DIDs
+    # acima, que só existem porque a montadora informou.
+    0xF190: DID(0xF190, "Chassi (VIN)", "", 17, None, 0.0,
+                "texto ASCII de 17 caracteres", "ISO 14229-1", kind="ascii"),
 }
+
+# DIDs cujo valor é texto, não número (atalho para a interface).
+TEXT_DIDS = {d for d, i in DID_DATABASE.items() if i.kind == "ascii"}
 
 # Sinais que a VWCO marcou como prioritários no pedido de validação.
 PRIORITY_DIDS = (0x0101, 0xD001, 0xE101)
@@ -410,16 +428,40 @@ def raw_to_int(data: bytes) -> int:
     return valor
 
 
-def interpret(did: int, data: bytes) -> tuple[Optional[float], str]:
+def decode_ascii(data: bytes) -> str:
     """
-    Aplica a conversão HIPOTÉTICA do DID sobre os bytes lidos.
+    Decodifica bytes ASCII de identificação (chassi, número de série, peça).
 
-    Devolve (valor, rótulo da hipótese). Valor None significa que não há
-    hipótese de escala para este DID — só o bruto faz sentido.
+    Tolerante de propósito: caracteres fora da faixa imprimível viram '.' em
+    vez de estourar exceção. Padding com 0x00 e 0xFF é comum no fim do campo
+    e é removido, assim como espaços nas pontas.
+    """
+    if not data:
+        return ""
+    texto = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    return texto.strip(". \x00").strip()
+
+
+def interpret(did: int, data: bytes):
+    """
+    Converte os bytes lidos de um DID no valor a exibir.
+
+    Devolve (valor, rótulo). O valor pode ser:
+      • float — quando há hipótese de escala (ver a advertência abaixo);
+      • str   — quando o DID é de texto (kind="ascii"), como o chassi;
+      • None  — quando não há como converter e só o bruto faz sentido.
+
+    Para DIDs proprietários a escala é HIPÓTESE, não norma: o rótulo devolvido
+    diz isso e a interface mostra o valor bruto ao lado.
     """
     info = DID_DATABASE.get(did)
-    if info is None or info.scale is None or not data:
+    if info is None or not data:
         return None, (info.hypothesis if info else "")
+    if info.kind == "ascii":
+        # Texto não tem escala: devolve a string decodificada.
+        return decode_ascii(data), info.hypothesis
+    if info.scale is None:
+        return None, info.hypothesis
     try:
         valor = raw_to_int(data) * info.scale + info.offset
     except Exception:
