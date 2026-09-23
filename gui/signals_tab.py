@@ -656,6 +656,40 @@ def _build_mat_string(vs_filter_num: int, sig: CandidateSignal) -> str:
     return head + "," + ",".join(ops)        # cabeçalho + operações separadas por vírgula
 
 
+def _origem_texto(sig: CandidateSignal) -> tuple:
+    """
+    Traduz a origem de um sinal mapeado em (rótulo curto, explicação).
+
+    A origem é o que diz QUANTO a fórmula vale. Duas fórmulas com a mesma
+    confiança numérica não são equivalentes se uma veio da norma e a outra de
+    uma estimativa de faixa — por isso a coluna existe na tabela e nos
+    documentos exportados, e não fica só no número da confiança.
+    """
+    origem = getattr(sig, "source", "estatistica")
+    if origem == "j1939":
+        return ("📗 Norma J1939", "Fator e offset OFICIAIS da base FMS/J1939 — "
+                                  "não foram estimados.")
+    if origem == "obd2":
+        return ("🔌 Lido por OBD-II", "Valor lido diretamente do veículo por "
+                                      "OBD-II/UDS, com a fórmula da norma.")
+    if origem == "calibrado":
+        return ("🎯 Calibrado", "Calibração manual de 2 pontos feita pelo "
+                                "operador com o veículo à frente.")
+    if origem == "obd2-ref":
+        r2 = getattr(sig, "r2_valid", 0.0)
+        n = getattr(sig, "n_ref", 0)
+        return (f"📈 Regressão OBD-II (R²={r2:.2f})",
+                f"Fórmula ajustada contra o valor REAL medido por OBD-II "
+                f"durante o teste.\n"
+                f"R² do ajuste: {getattr(sig, 'r2', 0.0):.4f}\n"
+                f"R² na validação cruzada (metade não usada no ajuste): {r2:.4f}\n"
+                f"{n} pares (bruto, valor real) sustentam o ajuste.")
+    return ("📊 Estimativa estatística",
+            "Correlação com o padrão esperado da instrução; fator e offset "
+            "estimados pela faixa que o teste esperava.\n"
+            "Confirme com a calibração de 2 pontos antes de usar em produção.")
+
+
 class SignalsTab(QWidget):
     """Aba principal "Sinais Mapeados".
 
@@ -676,6 +710,7 @@ class SignalsTab(QWidget):
         # para que o relatório PDF possa exibir as PGNs menos prováveis.
         self._all_candidates: dict[str, list[CandidateSignal]] = {}
         self._session_start: Optional[datetime] = None   # início da sessão (1ª descoberta)
+        self._vin: str = ""                  # chassi lido por OBD-II (identifica o veículo)
         self._bus = None                     # referência ao CANBus (p/ calibração)
         self._row_keys: list[str] = []       # mapeia índice de linha -> chave do sinal
         self._setup_ui()                     # monta a interface
@@ -727,9 +762,10 @@ class SignalsTab(QWidget):
         layout.addLayout(summary_row)
 
         # Tabela principal — 8 colunas, 0 linhas iniciais (preenchida depois).
-        self._table = QTableWidget(0, 8)
+        self._table = QTableWidget(0, 9)
         self._table.setHorizontalHeaderLabels([
-            "Sinal", "CAN ID", "Tipo", "PGN", "Nome PGN", "Byte(s)", "Fórmula", "Confiança"
+            "Sinal", "CAN ID", "Tipo", "PGN", "Nome PGN", "Byte(s)", "Fórmula",
+            "Origem", "Confiança"
         ])
         # Modos de redimensionamento de cada coluna: a maioria se ajusta ao
         # conteúdo; a coluna 6 ("Fórmula") estica para ocupar o espaço restante.
@@ -742,6 +778,7 @@ class SignalsTab(QWidget):
         hdr2.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         hdr2.setSectionResizeMode(6, QHeaderView.Stretch)
         hdr2.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        hdr2.setSectionResizeMode(8, QHeaderView.ResizeToContents)
         self._table.verticalHeader().setVisible(False)          # oculta numeração lateral de linhas
         self._table.setSelectionBehavior(QTableWidget.SelectRows)  # clicar seleciona a linha inteira
         layout.addWidget(self._table)
@@ -773,6 +810,59 @@ class SignalsTab(QWidget):
                     self._mappings[key] = candidates[0]
         self._rebuild_table()   # redesenha a tabela com o estado atualizado
 
+    def update_from_obd2(self, leituras: list, vin: str = ""):
+        """
+        Traz para o mapeamento o que foi lido por OBD-II / UDS.
+
+        POR QUE ISSO IMPORTA: um sinal lido por OBD-II **não é palpite**. O PID
+        vem da SAE J1979 com fórmula normalizada, e o valor chegou do próprio
+        veículo. Ele entra no mapeamento com confiança 0,97 e origem "lido por
+        OBD-II", ao lado dos sinais descobertos estatisticamente — e o relatório
+        passa a mostrar as duas naturezas lado a lado.
+
+        Parâmetros:
+          leituras — lista de dicionários vindos da aba OBD-II, cada um com:
+                     {key, nome, pid, src, unit, factor, offset, n_bytes,
+                      confiavel}. `confiavel` é False para DID proprietário,
+                      cuja escala é hipótese e não norma.
+          vin      — chassi lido, guardado para identificar o veículo nos
+                     documentos exportados.
+
+        Sinais já mapeados por CALIBRAÇÃO MANUAL não são sobrescritos: a
+        calibração de 2 pontos foi feita com o veículo à frente e vale mais.
+        """
+        if vin:
+            self._vin = vin
+        if self._session_start is None and leituras:
+            self._session_start = datetime.now()
+
+        for r in leituras:
+            key = r["key"]
+            anterior = self._mappings.get(key)
+            if anterior is not None and getattr(anterior, "source", "") == "calibrado":
+                continue          # calibração manual tem precedência
+            sig = CandidateSignal(
+                can_id=r["src"], is_extended=False,
+                # Na resposta [len, 0x41, PID, A, B, ...] o byte A é o 4º do
+                # quadro, ou seja, índice 3 em contagem 0-based.
+                byte_index=3, length_bytes=r.get("n_bytes", 1),
+                byte_order='big',            # dados de diagnóstico são big-endian
+                baseline_mean=0.0, baseline_std=0.0, test_range=0.0,
+                correlation=1.0,
+                formula_factor=r.get("factor", 1.0),
+                formula_offset=r.get("offset", 0.0),
+                formula_str=r.get("formula", ""),
+                pgn=None, pgn_name=r.get("pgn_name"),
+                spn_name=r.get("nome"),
+                # PID da norma: 0,97. DID proprietário com escala hipotética
+                # entra bem mais baixo, porque a conversão NÃO é normalizada.
+                confidence=0.97 if r.get("confiavel", True) else 0.45,
+                source="obd2" if r.get("confiavel", True) else "estatistica",
+            )
+            self._mappings[key] = sig
+            self._all_candidates.setdefault(key, [sig])
+        self._rebuild_table()
+
     # ── Table ─────────────────────────────────────────────────────────────────
 
     def _rebuild_table(self):
@@ -787,7 +877,11 @@ class SignalsTab(QWidget):
         for key, sig in self._mappings.items():
             self._row_keys.append(key)   # índice da linha == posição nesta lista
             test = TESTS.get(key)
-            signal_name = test.name if test else key
+            # Sinais vindos do OBD-II não estão no catálogo de testes: o nome
+            # deles vem do próprio candidato (spn_name), preenchido na
+            # importação.
+            signal_name = (test.name if test
+                           else (sig.spn_name or key))
 
             row = self._table.rowCount()
             self._table.insertRow(row)
@@ -805,17 +899,22 @@ class SignalsTab(QWidget):
             conf_color = (COLORS['success'] if sig.confidence > 0.8 else
                           COLORS['warning'] if sig.confidence > 0.5 else COLORS['error'])
 
-            # Texto e alinhamento de cada uma das 8 colunas, na ordem do cabeçalho.
+            origem_txt, origem_dica = _origem_texto(sig)
+
+            # Texto e alinhamento de cada uma das 9 colunas, na ordem do cabeçalho.
             values = [signal_name, id_str, type_str, pgn_str, pgn_name,
-                      byte_str, sig.formula_str, conf_str]
+                      byte_str, sig.formula_str, origem_txt, conf_str]
             aligns = [Qt.AlignLeft, Qt.AlignCenter, Qt.AlignCenter, Qt.AlignCenter,
-                      Qt.AlignLeft, Qt.AlignCenter, Qt.AlignLeft, Qt.AlignCenter]
+                      Qt.AlignLeft, Qt.AlignCenter, Qt.AlignLeft, Qt.AlignLeft,
+                      Qt.AlignCenter]
 
             for col, (text, align) in enumerate(zip(values, aligns)):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(align | Qt.AlignVCenter)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)   # célula somente leitura
                 if col == 7:
+                    item.setToolTip(origem_dica)   # explica o que sustenta a fórmula
+                if col == 8:
                     item.setForeground(QColor(conf_color))         # pinta a coluna de confiança
                 self._table.setItem(row, col, item)
 
@@ -901,6 +1000,12 @@ class SignalsTab(QWidget):
                 [("MODELO",             meta["modelo"]),
                  ("FABRICANTE",         meta["fabricante"]),
                  ("ANO",                meta["ano"])],
+                # Chassi lido por OBD-II: identifica o veículo exato de onde
+                # este mapeamento saiu. Fica vazio se não houve leitura.
+                [("CHASSI (VIN)",       self._vin or "—"),
+                 ("ORIGEM DO CHASSI",   "OBD-II modo 09 / UDS 0xF190"
+                                        if self._vin else "—"),
+                 ("",                   "")],
             ]
             # Escreve os metadados em 2 linhas, 3 pares (rótulo, valor) por linha.
             # Cada par ocupa 3 colunas: rótulo (1) + valor mesclado em 2 colunas.
@@ -925,7 +1030,7 @@ class SignalsTab(QWidget):
             # Colunas da tabela VIRLOC. "MAT" e "VS" recebem as strings geradas
             # por _build_mat_string e _build_vs_string.
             headers = ["Prioridade", "CT", "INFORMAÇÕES", "PGN", "BYTE",
-                       "MAT", "UNIDADE MEDIDA", "VS", "OBSERVAÇÃO"]
+                       "MAT", "UNIDADE MEDIDA", "VS", "ORIGEM", "OBSERVAÇÃO"]
             HEADER_ROW = 4   # a tabela começa na linha 4 (1-2 = metadados, 3 = espaço)
             for c, h in enumerate(headers, start=1):
                 cell = ws.cell(row=HEADER_ROW, column=c, value=h)
@@ -936,7 +1041,7 @@ class SignalsTab(QWidget):
 
             # Larguras das colunas (em "caracteres"). A coluna VS (8ª) é a mais
             # larga porque a string VS é longa.
-            widths = [12, 6, 28, 8, 10, 26, 16, 70, 22]
+            widths = [12, 6, 28, 8, 10, 26, 16, 70, 26, 22]
             for c, w in enumerate(widths, start=1):
                 ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -962,7 +1067,7 @@ class SignalsTab(QWidget):
             vs_fn  = 0           # número do filtro S19 (00..24) → cabeçalho VS19xx
             ct_num = 1           # número do CT no VS (01..96)
             for key, sig in self._mappings.items():
-                nome    = _SIGNAL_INFO_NAME.get(key, key)      # nome amigável
+                nome    = _SIGNAL_INFO_NAME.get(key) or sig.spn_name or key
                 unidade = _SIGNAL_UNIT.get(key, "")            # unidade de medida
                 vs_str  = _build_vs_string(vs_fn, ct_num, sig) # string VS do filtro
                 mat_str = _build_mat_string(vs_fn, sig)        # string MAT (conversão)
@@ -970,17 +1075,23 @@ class SignalsTab(QWidget):
                 if sig.length_bytes > 1:
                     byte_str += f"–{sig.byte_index + sig.length_bytes}"   # faixa se >1 byte
 
+                # ORIGEM: diz o que sustenta a fórmula daquela linha. Quem
+                # recebe a planilha precisa distinguir "fator da norma" de
+                # "fator estimado" — são níveis de confiança diferentes para
+                # um número que, na célula, parece igualmente definitivo.
+                origem_txt, _ = _origem_texto(sig)
                 # Sinais mapeados têm prioridade "Alta".
                 values = ["Alta", f"{ct:03d}", nome,
                           str(sig.pgn) if sig.pgn else "",
-                          byte_str, mat_str, unidade, vs_str, ""]
+                          byte_str, mat_str, unidade, vs_str, origem_txt, ""]
                 fill = row_fill_a if ct % 2 == 0 else row_fill_b   # cor alternada (zebra)
                 for c, v in enumerate(values, start=1):
                     cell = ws.cell(row=row, column=c, value=v)
                     cell.border    = border
                     cell.fill      = fill
-                    # Colunas 3 (INFORMAÇÕES), 6 (MAT) e 8 (VS) alinham à esquerda.
-                    cell.alignment = left if c in (3, 6, 8) else center
+                    # Colunas 3 (INFORMAÇÕES), 6 (MAT), 8 (VS) e 9 (ORIGEM)
+                    # alinham à esquerda.
+                    cell.alignment = left if c in (3, 6, 8, 9) else center
                 row    += 1
                 ct     += 1
                 vs_fn  += 1   # próximo filtro VS
@@ -1079,6 +1190,7 @@ class SignalsTab(QWidget):
                                        f"{s} {_fmt(abs(offset))}  [{unit}]")
                 # Calibração manual é confiável → eleva a confiança a (no mínimo) 99%.
                 sig.confidence = max(sig.confidence, 0.99)
+                sig.source = "calibrado"     # registra a origem da fórmula
                 self._rebuild_table()   # reflete a nova fórmula/confiança na tabela
                 QMessageBox.information(
                     self, "Calibrado",
@@ -1702,6 +1814,7 @@ class SignalsTab(QWidget):
         """Limpa toda a sessão: mapeamentos, candidatos, tabela e resumo."""
         self._mappings.clear()           # remove os sinais mapeados
         self._all_candidates.clear()     # remove os candidatos guardados
+        self._vin = ""                   # esquece o chassi da sessão anterior
         self._session_start = None       # zera o cronômetro da sessão
         self._table.setRowCount(0)       # esvazia a tabela
         self._lbl_summary.setText("Nenhum sinal mapeado ainda.")

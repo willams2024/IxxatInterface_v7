@@ -35,11 +35,14 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QFrame, QProgressBar, QScrollArea,
     QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSplitter, QTextEdit,
+    QSplitter, QTextEdit, QCheckBox,
 )
 
 from core.can_bus import CANMessage
 from core.discovery import DiscoveryEngine, Phase, TESTS, TestDefinition, CandidateSignal
+# Leitura OBD-II usada como REFERÊNCIA MEDIDA durante o teste: consultamos o
+# PID que mede o mesmo sinal e alimentamos o motor com o valor real.
+from core.obd2 import PID_DATABASE, build_request, parse_response
 from gui.styles import COLORS
 
 
@@ -207,6 +210,19 @@ class DiscoveryTab(QWidget):
         # NÃO recebe mensagens CAN — apenas atualiza widgets a ~10 Hz (100 ms).
         self._tick_timer = QTimer(self)
         self._tick_timer.timeout.connect(self._tick)
+
+        # ── Referência medida por OBD-II ─────────────────────────────────────
+        # Quando o teste tem um PID equivalente (TestDefinition.obd_pid) e o
+        # barramento permite transmitir, consultamos esse PID durante o teste.
+        # A leitura real vira a referência da análise: a fórmula sai de
+        # regressão contra o valor verdadeiro, não de palpite sobre a faixa.
+        self._ref_timer = QTimer(self)
+        self._ref_timer.timeout.connect(self._poll_reference)
+        self._ref_pid = None        # PID em consulta durante o teste
+        self._ref_last_sent = 0.0   # instante do último request (gate)
+        self._ref_count = 0         # quantas leituras válidas chegaram
+        self._ref_last_value = None # última leitura, para exibir na tela
+
         self._setup_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -366,6 +382,21 @@ class DiscoveryTab(QWidget):
         self._btn_sim.setToolTip("Injeta o sinal simulado durante o teste (requer Modo Simulacao ativo)")
         self._btn_sim.clicked.connect(lambda: self._toggle_simulation())
         btn_row.addWidget(self._btn_sim)
+
+        # Referência OBD-II: desmarcada por padrão porque TRANSMITE no
+        # barramento. O rótulo diz o ganho, o tooltip diz o custo.
+        self._chk_ref = QCheckBox("🎯  Usar OBD-II como referência")
+        self._chk_ref.setToolTip(
+            "Consulta, durante o teste, o PID do OBD-II que mede ESTE MESMO\n"
+            "sinal, e usa a leitura real como referência da análise.\n\n"
+            "Ganho: a fórmula passa a sair de regressão contra o valor\n"
+            "verdadeiro (com R² e validação cruzada) em vez de ser estimada\n"
+            "pela faixa esperada da instrução.\n\n"
+            "Custo: o programa TRANSMITE um request de leitura a cada 150 ms\n"
+            "durante o teste. Exige Listen-Only desmarcado e só funciona nos\n"
+            "sinais que têm PID equivalente."
+        )
+        btn_row.addWidget(self._chk_ref)
         btn_row.addStretch()
         right_layout.addLayout(btn_row)
 
@@ -468,6 +499,7 @@ class DiscoveryTab(QWidget):
         if not self._active_test or not self._bus.is_connected:
             return
         self._engine.start_test(self._active_test)
+        self._start_reference()
         self._tick_timer.start(100)
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(True)
@@ -477,6 +509,70 @@ class DiscoveryTab(QWidget):
         if self._active_test.key in self._cards:
             self._cards[self._active_test.key].set_status("running", "Teste em andamento...")
 
+    # ── Referência medida por OBD-II ──────────────────────────────────────────
+
+    def _start_reference(self):
+        """
+        Liga a consulta do PID de referência, se ela for possível e desejada.
+
+        Três condições, todas necessárias:
+          1) o operador marcou "Usar OBD-II como referência";
+          2) o teste tem PID equivalente (TestDefinition.obd_pid);
+          3) o barramento pode transmitir (listen-only desmarcado, ou simulação).
+
+        Falhando qualquer uma, a análise segue pelo caminho estatístico normal
+        — a referência é um ganho opcional, nunca um requisito.
+        """
+        self._ref_pid = None
+        self._ref_count = 0
+        self._ref_last_value = None
+        if not self._chk_ref.isChecked():
+            return
+        pid = getattr(self._active_test, "obd_pid", None)
+        if pid is None:
+            return
+        if self._bus is None or not self._bus.is_connected:
+            return
+        if (not self._bus.is_simulation) and self._bus.is_listen_only:
+            self._lbl_status.setText(
+                "Referência OBD-II indisponível: reconecte com Listen-Only "
+                "desmarcado. O teste segue pelo método estatístico.")
+            return
+        self._ref_pid = pid
+        self._ref_last_sent = 0.0
+        # ~6-7 consultas por segundo: resolução suficiente para acompanhar
+        # rotação e velocidade, e gentil com o barramento.
+        self._ref_timer.start(150)
+
+    def _stop_reference(self):
+        """Encerra a consulta de referência (fim ou interrupção do teste)."""
+        self._ref_timer.stop()
+        self._ref_pid = None
+
+    @pyqtSlot()
+    def _poll_reference(self):
+        """
+        Envia um request do PID de referência.
+
+        Mantém no máximo um request em voo por vez (janela de 400 ms): se a
+        resposta não veio, não adianta empilhar perguntas — a ECU pode estar
+        limitando taxa, e rajada de request atrapalha a própria captura.
+        """
+        if self._ref_pid is None or self._bus is None or not self._bus.is_connected:
+            return
+        agora = time.time()
+        if agora - self._ref_last_sent < 0.4 and self._ref_count == 0:
+            return              # ainda esperando a primeira resposta
+        can_id, data = build_request(self._ref_pid)
+        ok, msg = self._bus.send(can_id, data, is_extended=False)
+        self._ref_last_sent = agora
+        if not ok:
+            # Transmissão recusada (listen-only, política de segurança…):
+            # desliga a referência e deixa o teste seguir pelo caminho normal.
+            self._stop_reference()
+            self._lbl_status.setText(
+                f"Referência OBD-II desligada: {msg.splitlines()[0]}")
+
     def _stop_test(self):
         """Interrompe o teste em andamento.
 
@@ -485,6 +581,7 @@ class DiscoveryTab(QWidget):
         de fases e desliga qualquer simulação ativa.
         """
         self._tick_timer.stop()
+        self._stop_reference()
         self._engine.phase = Phase.IDLE
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
@@ -563,8 +660,23 @@ class DiscoveryTab(QWidget):
         Args:
             msg: mensagem CAN recebida (id, dados, flag de id estendido).
         """
-        if self._engine.phase in (Phase.BASELINE, Phase.TESTING):
-            self._engine.feed(msg.can_id, msg.data, msg.is_extended)
+        if self._engine.phase not in (Phase.BASELINE, Phase.TESTING):
+            return
+        self._engine.feed(msg.can_id, msg.data, msg.is_extended)
+
+        # Resposta do PID de referência? Alimenta o motor com o valor REAL.
+        # parse_response já filtra faixa de ID, tipo de quadro e modo, então
+        # aqui só verificamos se é o PID que estamos acompanhando.
+        if self._ref_pid is None:
+            return
+        try:
+            res = parse_response(msg.can_id, msg.data)
+        except Exception:
+            return
+        if res and res.get("pid") == self._ref_pid:
+            self._engine.feed_reference(res["value"])
+            self._ref_count += 1
+            self._ref_last_value = res["value"]
 
     # ── Periodic tick ─────────────────────────────────────────────────────────
 
@@ -601,7 +713,17 @@ class DiscoveryTab(QWidget):
         # sinal varie e o engine consiga isolá-lo. Destaque visual reforçado.
         elif phase == Phase.TESTING:
             self._set_phase_active(1)
-            self._lbl_status.setText(f"⚡ REALIZE A AÇÃO AGORA! {secs:.0f}s restantes")
+            extra = ""
+            if self._ref_pid is not None:
+                info = PID_DATABASE.get(self._ref_pid)
+                if self._ref_count:
+                    extra = (f"   |   🎯 referência: {self._ref_last_value:.0f} "
+                             f"{info.unit if info else ''} "
+                             f"({self._ref_count} leituras)")
+                else:
+                    extra = "   |   🎯 aguardando resposta do PID de referência…"
+            self._lbl_status.setText(
+                f"⚡ REALIZE A AÇÃO AGORA! {secs:.0f}s restantes{extra}")
             self._lbl_status.setStyleSheet(f"color: {COLORS['warning']}; font-weight: bold; font-size: 14px;")
 
         # Fase 3 — ANALYZING: o engine compara baseline x teste e pontua candidatos.
@@ -612,6 +734,7 @@ class DiscoveryTab(QWidget):
         # Fase 4 — DONE: terminou. Encerra o ciclo e mostra os resultados.
         elif phase == Phase.DONE:
             self._tick_timer.stop()
+            self._stop_reference()
             self._set_phase_active(3)
             self._btn_start.setEnabled(True)
             self._btn_stop.setEnabled(False)

@@ -780,15 +780,29 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int)
     def _on_tab_changed(self, idx: int):
-        """Ao abrir a aba 'Sinais Mapeados', importa os resultados da Descoberta.
+        """Ao abrir a aba 'Sinais Mapeados', importa o que as outras abas produziram.
 
-        Assim, ao trocar para essa aba, ela já reflete os sinais descobertos
-        mais recentes sem o usuário precisar exportar/recarregar manualmente.
+        São DUAS fontes, e a aba de mapeamento reúne as duas:
+          • Descoberta de Sinais — candidatos encontrados por estatística;
+          • OBD-II / UDS — sinais que o veículo já entrega prontos, com
+            fórmula da norma, mais o chassi que identifica o veículo.
+
+        Fazer isso na troca de aba evita que o operador precise exportar e
+        recarregar nada: ele descobre, lê por diagnóstico e o mapeamento já
+        está consolidado quando ele chega para exportar.
         """
         if self._tabs.widget(idx) is self._signals_tab:
             results = self._discovery_tab.get_saved_results()
             if results:
                 self._signals_tab.update_from_discovery(results)
+            try:
+                leituras, vin = self._obd2_tab.leituras_para_mapeamento()
+                if leituras or vin:
+                    self._signals_tab.update_from_obd2(leituras, vin)
+            except Exception:
+                # Falha ao importar do OBD-II não pode impedir o operador de
+                # ver e exportar o que a descoberta já mapeou.
+                pass
 
     # ── Atualização de status (rodapé) ──────────────────────────────────────
 

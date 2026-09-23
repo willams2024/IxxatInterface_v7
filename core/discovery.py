@@ -188,6 +188,98 @@ def _resample(values: list, n: int) -> list:
     return result
 
 
+def _linear_fit(xs: list, ys: list) -> tuple:
+    """
+    Ajuste linear por mínimos quadrados: encontra (a, b) em y = a·x + b.
+
+    Devolve (a, b, r2), onde r2 é o coeficiente de determinação (0..1): a
+    fração da variação de y que a reta explica. r2 = 1 é ajuste perfeito.
+
+    POR QUE ISSO É MELHOR QUE ESTIMAR PELA FAIXA:
+    o método antigo mapeia [menor bruto..maior bruto] para
+    [expected_min..expected_max] da instrução. Isso assume que o operador
+    percorreu EXATAMENTE a faixa esperada — se ele foi só até 40 km/h num
+    teste que espera 120, o fator sai errado por um fator de 3.
+
+    A regressão usa o valor REAL medido a cada instante (lido por OBD-II), e
+    portanto não depende de o operador ter acertado a faixa. Além disso, o r2
+    diz o quanto aquele byte de fato explica o sinal — é uma medida de
+    qualidade, não um palpite de confiança.
+    """
+    n = len(xs)
+    if n < 3 or n != len(ys):
+        return 0.0, 0.0, 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    if sxx <= 0:
+        return 0.0, 0.0, 0.0     # bruto constante: não há reta
+    a = sxy / sxx                # inclinação (o "fator")
+    b = my - a * mx              # intercepto (o "offset")
+    # r2 = 1 - (soma dos residuos²) / (variação total de y)
+    syy = sum((y - my) ** 2 for y in ys)
+    if syy <= 0:
+        return a, b, 0.0         # valor real constante: r2 indefinido
+    ss_res = sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1.0 - ss_res / syy
+    return a, b, max(0.0, min(1.0, r2))
+
+
+def _cross_validate(pairs: list) -> float:
+    """
+    Validação cruzada do ajuste: treina na 1ª metade, avalia na 2ª.
+
+    Ajusta a reta usando apenas a primeira metade das amostras e mede o r2
+    dessa reta contra a SEGUNDA metade, que ela nunca viu.
+
+    POR QUE: um byte pode casar por coincidência dentro da janela onde o
+    ajuste foi feito — principalmente byte com pouca variação ou contador que
+    cresce junto com o tempo. Se a relação é real, a reta ajustada no começo
+    do teste continua valendo no fim. Se o r2 despenca na segunda metade, era
+    coincidência, e a confiança precisa refletir isso.
+    """
+    n = len(pairs)
+    if n < 8:
+        return 0.0            # poucas amostras: não dá para dividir
+    meio = n // 2
+    treino, teste = pairs[:meio], pairs[meio:]
+    a, b, _ = _linear_fit([p[0] for p in treino], [p[1] for p in treino])
+    if a == 0.0:
+        return 0.0
+    ys = [p[1] for p in teste]
+    my = sum(ys) / len(ys)
+    syy = sum((y - my) ** 2 for y in ys)
+    if syy <= 0:
+        return 0.0
+    ss_res = sum((y - (a * p[0] + b)) ** 2 for p, y in zip(teste, ys))
+    return max(0.0, min(1.0, 1.0 - ss_res / syy))
+
+
+def _interp_at(serie: list, t: float) -> Optional[float]:
+    """
+    Valor da série de referência no instante t, por interpolação linear.
+
+    `serie` é uma lista [(instante, valor)] ORDENADA. Devolve None quando t
+    cai fora do intervalo coberto — amostra sem referência não entra no
+    ajuste, em vez de ser extrapolada (extrapolar inventaria dado).
+    """
+    if not serie:
+        return None
+    if t < serie[0][0] or t > serie[-1][0]:
+        return None
+    # Busca o par de pontos que cerca t (série pequena: varredura linear serve).
+    for i in range(1, len(serie)):
+        t0, v0 = serie[i - 1]
+        t1, v1 = serie[i]
+        if t <= t1:
+            if t1 == t0:
+                return v1
+            frac = (t - t0) / (t1 - t0)
+            return v0 + (v1 - v0) * frac
+    return serie[-1][1]
+
+
 def _is_monotonic_increasing(values: list, tolerance: int = 1) -> bool:
     """True se a série só cresce (com pequena tolerância para ruído).
 
@@ -238,14 +330,25 @@ class ByteStats:
     desse histórico calculamos média, variância, desvio, mínimo, máximo e
     amplitude (range) — métricas que alimentam o algoritmo de descoberta.
     """
-    # Histórico dos valores do byte. deque(maxlen=500) descarta
-    # automaticamente o valor mais antigo quando passa de 500 amostras
+    # Histórico dos valores do byte. deque(maxlen=2000) descarta
+    # automaticamente o valor mais antigo quando passa desse limite
     # (janela deslizante), limitando o uso de memória.
-    values: deque = field(default_factory=lambda: deque(maxlen=500))
+    values: deque = field(default_factory=lambda: deque(maxlen=2000))
+    # Instante (time.time) de cada amostra, na mesma ordem de `values`.
+    # Existe para permitir ALINHAR NO TEMPO a série do byte com a série de
+    # referência medida por OBD-II — sem timestamp só daria para assumir
+    # amostragem uniforme, hipótese que quebra quando a mensagem tem taxa
+    # variável ou quando a janela deslizante descarta o começo do teste.
+    times: deque = field(default_factory=lambda: deque(maxlen=2000))
 
-    def push(self, v: int):
-        """Adiciona uma nova leitura do byte ao histórico."""
+    def push(self, v: int, t: float = 0.0):
+        """Adiciona uma nova leitura do byte (e o instante em que chegou)."""
         self.values.append(v)
+        self.times.append(t)
+
+    def pairs(self) -> list:
+        """Lista [(instante, valor)] das amostras, para alinhamento temporal."""
+        return list(zip(self.times, self.values))
 
     @property
     def mean(self) -> float:
@@ -305,6 +408,20 @@ class CandidateSignal:
     pgn_name: Optional[str] = None   # Acrônimo/nome do PGN (se conhecido).
     spn_name: Optional[str] = None   # Nome do SPN (parâmetro) correspondente.
     confidence: float = 0.0          # Confiança final 0..1 (usada para ranquear).
+    # ── Evidência de como o candidato foi obtido ─────────────────────────────
+    # source: de onde veio a fórmula, o que determina o quanto ela vale.
+    #   "j1939"      — PGN/SPN conhecido: fator e offset OFICIAIS da norma.
+    #   "obd2-ref"   — regressão contra o valor REAL medido por OBD-II durante
+    #                  o teste. É o melhor caso estatístico: a fórmula não é
+    #                  palpite, é ajuste sobre o valor verdadeiro.
+    #   "estatistica"— correlação contra o padrão idealizado da instrução e
+    #                  fator estimado por faixa esperada (palpite informado).
+    #   "calibrado"  — calibração manual de 2 pontos feita pelo operador.
+    #   "obd2"       — lido direto por OBD-II/UDS (não é descoberta).
+    source: str = "estatistica"
+    r2: float = 0.0          # Coeficiente de determinação do ajuste (0..1).
+    r2_valid: float = 0.0    # R² na VALIDAÇÃO CRUZADA (metade não usada no ajuste).
+    n_ref: int = 0           # Quantos pares (bruto, valor real) sustentaram o ajuste.
     # Forma de onda observada durante o TESTE (valores em engenharia já
     # convertidos: raw*factor+offset), reamostrada para ~80 pontos. Usada para
     # desenhar o "gráfico de comportamento observado" no relatório PDF.
@@ -345,6 +462,13 @@ class TestDefinition:
     spn_hints: list         # Nomes de SPN conhecidos para casar com o PGN.
     sim_inject_attr: str    # Atributo do simulador (SimState) a acionar no modo
                             # de simulação; "" quando não há injeção simulada.
+    obd_pid: Optional[int] = None
+                            # PID do OBD-II modo 01 que mede ESTE MESMO sinal.
+                            # Quando existe e o veículo responde, o motor usa a
+                            # leitura real como REFERÊNCIA no lugar do padrão
+                            # idealizado — ver DiscoveryEngine.feed_reference().
+                            # None = não há equivalente padronizado (sinais
+                            # binários, horímetro, pressão pneumática…).
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -395,6 +519,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGN 61444 (EEC1) carrega a velocidade do motor em J1939 — checado antes.
         pgn_hints=[61444], spn_hints=["Velocidade do Motor (RPM)"],
         sim_inject_attr="inject_rpm_peak",
+        obd_pid=0x0C,   # OBD-II modo 01: rotação do motor
     ),
 
     "speed": TestDefinition(
@@ -417,6 +542,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGN 65265 (CCVS) traz a velocidade do veículo em J1939.
         pgn_hints=[65265], spn_hints=["Velocidade do Veículo"],
         sim_inject_attr="inject_speed_ramp",
+        obd_pid=0x0D,   # OBD-II modo 01: velocidade do veículo
     ),
 
     "throttle": TestDefinition(
@@ -436,6 +562,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGNs 61443 (EEC2) / 61444 (EEC1) costumam conter a posição do pedal.
         pgn_hints=[61443, 61444], spn_hints=["Posição Pedal Acelerador"],
         sim_inject_attr="inject_throttle_ramp",
+        obd_pid=0x11,   # OBD-II modo 01: posição da borboleta
     ),
 
     "clutch": TestDefinition(
@@ -521,6 +648,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGN 65262 (ET1) traz a temperatura do líquido de arrefecimento.
         pgn_hints=[65262], spn_hints=["Temp. Líquido de Arrefecimento"],
         sim_inject_attr="",
+        obd_pid=0x05,   # OBD-II modo 01: temperatura do arrefecimento
     ),
 
     "oil_temp": TestDefinition(
@@ -539,6 +667,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGN 65262 (ET1) também contém a temperatura do óleo do motor.
         pgn_hints=[65262], spn_hints=["Temp. Óleo do Motor"],
         sim_inject_attr="",
+        obd_pid=0x5C,   # OBD-II modo 01: temperatura do óleo
     ),
 
     "oil_pressure": TestDefinition(
@@ -635,6 +764,7 @@ TESTS: dict[str, TestDefinition] = {
         # Mesmos PGNs de distância (65248 VD / 65217 HRVD).
         pgn_hints=[65248, 65217], spn_hints=["Hodômetro Total"],
         sim_inject_attr="",
+        obd_pid=0xA6,   # OBD-II modo 01: odômetro
     ),
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -697,6 +827,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGN 64695 (DC/DC ou tensão) — checado como atalho.
         pgn_hints=[64695], spn_hints=["Tensão Bateria"],
         sim_inject_attr="",
+        obd_pid=0x42,   # OBD-II modo 01: tensão do módulo de controle
     ),
 
     "fuel_level": TestDefinition(
@@ -716,6 +847,7 @@ TESTS: dict[str, TestDefinition] = {
         # PGN 65276 (DD — Dash Display) carrega o nível de combustível.
         pgn_hints=[65276], spn_hints=["Nível Combustível"],
         sim_inject_attr="",
+        obd_pid=0x2F,   # OBD-II modo 01: nível do tanque
     ),
 
     "seatbelt": TestDefinition(
@@ -830,6 +962,11 @@ class DiscoveryEngine:
         # Última flag is_extended vista em feed(); usada por tick() para concluir
         # o teste mesmo quando o fluxo de mensagens para (ex.: replay CSV acabou).
         self._last_is_extended = True
+        # Série de REFERÊNCIA MEDIDA: [(instante, valor em engenharia)] lida do
+        # próprio veículo por OBD-II durante o teste. Quando existe, substitui
+        # o padrão idealizado da instrução na correlação e permite calcular
+        # fator/offset por regressão. Ver feed_reference().
+        self._ref_series: list = []
 
     def start_test(self, test: TestDefinition):
         """Inicia um novo teste: zera os buffers e entra na fase BASELINE.
@@ -840,6 +977,7 @@ class DiscoveryEngine:
         self._current_test = test
         self._baseline_stats.clear()   # descarta dados de testes anteriores.
         self._test_stats.clear()
+        self._ref_series = []          # referência medida é por teste
         self.results = []
         self.progress = 0.0
         self.phase = Phase.BASELINE
@@ -870,12 +1008,57 @@ class DiscoveryEngine:
         # feitas por tick() (chamado pelo timer da GUI), garantindo que o teste
         # SEMPRE conclua por tempo de parede, mesmo se as mensagens pararem
         # (ex.: o replay do CSV terminou no meio do teste).
+        agora = time.time()
         if self.phase == Phase.BASELINE:
             for i, b in enumerate(data):
-                self._baseline_stats[(can_id, i)].push(b)
+                self._baseline_stats[(can_id, i)].push(b, agora)
         elif self.phase == Phase.TESTING:
             for i, b in enumerate(data):
-                self._test_stats[(can_id, i)].push(b)
+                self._test_stats[(can_id, i)].push(b, agora)
+
+    def feed_reference(self, value: float, t: Optional[float] = None):
+        """
+        Registra uma leitura da REFERÊNCIA MEDIDA (valor real do sinal).
+
+        Chamado pela interface quando chega uma resposta de OBD-II do PID que
+        mede o mesmo sinal do teste em andamento (TestDefinition.obd_pid).
+        Só acumula durante a fase TESTING: é o trecho em que o operador está
+        provocando o sinal e, portanto, onde a relação entre o byte do
+        barramento e o valor real fica visível.
+
+        A diferença que isso faz: em vez de correlacionar cada byte com um
+        padrão IDEALIZADO ("deve subir de 800 a 3500"), o motor correlaciona
+        com o que o veículo REALMENTE fez, e ajusta a fórmula por regressão
+        sobre esse valor verdadeiro.
+        """
+        if self.phase != Phase.TESTING:
+            return
+        self._ref_series.append((t if t is not None else time.time(),
+                                 float(value)))
+
+    def has_reference(self) -> bool:
+        """True quando há referência medida suficiente para guiar a análise."""
+        return len(self._ref_series) >= 8
+
+    def _pairs_with_reference(self, times: list, values: list) -> list:
+        """
+        Casa a série de um byte com a referência medida, ALINHANDO NO TEMPO.
+
+        Para cada amostra do byte, interpola o valor real no mesmo instante.
+        Amostras fora da janela coberta pela referência são descartadas — não
+        se extrapola, porque extrapolação inventaria dado e inflaria o ajuste.
+
+        Devolve [(bruto, valor_real)] pronto para a regressão.
+        """
+        ref = self._ref_series
+        if len(ref) < 2:
+            return []
+        pares = []
+        for t, v in zip(times, values):
+            alvo = _interp_at(ref, t)
+            if alvo is not None:
+                pares.append((float(v), alvo))
+        return pares
 
     def tick(self):
         """
@@ -1118,6 +1301,7 @@ class DiscoveryEngine:
                         formula_str=formula_str,
                         pgn=pgn_num, pgn_name=pgn_info.acronym, spn_name=spn.name,
                         confidence=0.98,       # confiança altíssima (PGN conhecido).
+                        source="j1939",        # fator/offset OFICIAIS da norma
                     ))
         return results
 
@@ -1138,6 +1322,11 @@ class DiscoveryEngine:
              correlação positiva ou negativa (sinal pode estar invertido).
         """
         results = []
+
+        # Há referência MEDIDA para este teste? Ela muda o método: correlação
+        # e fórmula passam a sair de regressão contra o valor real do veículo,
+        # em vez de comparação com o padrão idealizado da instrução.
+        usar_ref = self.has_reference()
 
         # Verifica se o padrão de referência é estritamente crescente.
         # (Crescente o suficiente: todos os passos não-decrescentes e o fim
@@ -1193,6 +1382,66 @@ class DiscoveryEngine:
                 options.append((2, 'big', be_series,
                                 max(be_series) - min(be_series), byte_idx + 1))
 
+            # ═══ CAMINHO PREFERENCIAL: referência MEDIDA por OBD-II ═══════════
+            # Quando o veículo respondeu o PID que mede este mesmo sinal, não
+            # há motivo para adivinhar: escolhemos a interpretação e a fórmula
+            # por REGRESSÃO contra o valor real, e a confiança passa a ser o
+            # r2 validado — uma medida de qualidade do ajuste, não um palpite.
+            if usar_ref:
+                tempos_1b = list(test_stats.times)
+                melhor_ref = None       # (lb, order, series, rng, neighbor, a, b, r2, r2v, n)
+                for (lb, order, series, rng, neighbor) in options:
+                    if rng < 1:
+                        continue
+                    # Os dois bytes de um par vêm do MESMO quadro, então os
+                    # instantes são os do byte base (truncados ao tamanho da
+                    # série combinada).
+                    tempos = tempos_1b[:len(series)]
+                    pares = self._pairs_with_reference(tempos, series)
+                    if len(pares) < 8:
+                        continue
+                    xs = [p[0] for p in pares]
+                    ys = [p[1] for p in pares]
+                    a, b, r2 = _linear_fit(xs, ys)
+                    if a == 0.0:
+                        continue
+                    r2v = _cross_validate(pares)
+                    if melhor_ref is None or r2v > melhor_ref[8]:
+                        melhor_ref = (lb, order, series, rng, neighbor,
+                                      a, b, r2, r2v, len(pares))
+                if melhor_ref is not None:
+                    (length_bytes, byte_order, series, raw_range, neighbor,
+                     factor, offset, r2, r2v, n_pares) = melhor_ref
+                    if length_bytes == 2 and neighbor is not None:
+                        used.add((can_id, neighbor))
+                    factor = float(f"{factor:.6g}")
+                    offset = float(f"{offset:.6g}")
+                    pgn_num, pgn_name = None, None
+                    if is_j1939(can_id, is_extended):
+                        _, pgn_num, _ = decode_29bit_id(can_id)
+                        pgn_info = PGN_DATABASE.get(pgn_num)
+                        pgn_name = pgn_info.acronym if pgn_info else f"PGN {pgn_num}"
+                    results.append(CandidateSignal(
+                        can_id=can_id, is_extended=is_extended,
+                        byte_index=byte_idx, length_bytes=length_bytes,
+                        byte_order=byte_order,
+                        baseline_mean=baseline.mean, baseline_std=baseline.std,
+                        test_range=raw_range,
+                        correlation=math.sqrt(max(0.0, r2)),
+                        formula_factor=factor, formula_offset=offset,
+                        formula_str=self._format_formula(factor, offset, t.unit),
+                        pgn=pgn_num, pgn_name=pgn_name,
+                        # Teto de 0,97: ajuste contra valor real é forte, mas
+                        # continua sendo inferência sobre uma janela de teste —
+                        # só a norma J1939 (0,98) e a calibração manual (0,99)
+                        # valem mais.
+                        confidence=min(0.97, r2v * 0.97),
+                        source="obd2-ref", r2=r2, r2_valid=r2v, n_ref=n_pares,
+                    ))
+                    used.add((can_id, byte_idx))
+                    continue    # este byte já foi resolvido pela referência
+
+            # ═══ CAMINHO ESTATÍSTICO (sem referência medida) ══════════════════
             # Escolhe a melhor opção: maior correlação com reference_values
             # (Se não houver ref, prefere a interpretação com maior range coerente.)
             # expected_range = amplitude esperada do sinal em engenharia.

@@ -914,6 +914,72 @@ class OBD2Tab(QWidget):
                     rec["min"] = rec["max"] = value
 
     # ════════════════════════════════════════════════════════════════════════
+    #  Entrega das leituras para o mapeamento
+    # ════════════════════════════════════════════════════════════════════════
+
+    def leituras_para_mapeamento(self) -> tuple:
+        """
+        Empacota o que foi lido nesta aba para a aba "Sinais Mapeados".
+
+        Devolve (leituras, vin). Cada leitura descreve um sinal que o veículo
+        JÁ ENTREGA por diagnóstico — não precisa ser descoberto por
+        estatística. O campo `confiavel` separa as duas naturezas:
+
+          • PID do modo 01 → fórmula da SAE J1979, normalizada: confiável;
+          • DID proprietário → escala é HIPÓTESE da montadora: não confiável,
+            entra no mapeamento com confiança baixa e precisa de calibração.
+
+        O chassi não vira sinal (é texto): volta separado, para identificar o
+        veículo nos documentos exportados.
+        """
+        leituras, vin = [], ""
+        for (kind, num, src) in sorted(self._doc_obs):
+            rec = self._doc_obs[(kind, num, src)]
+            item = (kind, num)
+
+            # Chassi: identificação do veículo, não é sinal mapeável.
+            if kind == KIND_PID9 or (kind == KIND_DID and num in TEXT_DIDS):
+                if isinstance(rec.get("last_value"), str) and rec["last_value"]:
+                    vin = rec["last_value"]
+                continue
+
+            if kind == KIND_PID:
+                info = PID_DATABASE.get(num)
+                if info is None:
+                    continue
+                leituras.append({
+                    "key": f"obd2_pid_{num:02X}",
+                    "nome": info.name, "src": src, "unit": info.unit,
+                    "n_bytes": info.n_bytes,
+                    # O fator/offset exatos do PID não são um par simples para
+                    # todo PID (há fórmulas com divisão), então levamos a
+                    # fórmula em texto e deixamos o fator para a conversão
+                    # linear mais comum.
+                    "factor": 1.0, "offset": 0.0,
+                    "formula": f"SAE J1979 PID 0x{num:02X}: {formula_text(num)}"
+                               f"  [{info.unit}]",
+                    "pgn_name": f"OBD-II PID 0x{num:02X}",
+                    "confiavel": True,
+                })
+            else:
+                info = DID_DATABASE.get(num)
+                if info is None:
+                    continue
+                leituras.append({
+                    "key": f"uds_did_{num:04X}",
+                    "nome": info.name, "src": src, "unit": info.unit,
+                    "n_bytes": info.n_bytes or 1,
+                    "factor": info.scale or 1.0, "offset": info.offset,
+                    "formula": f"UDS DID 0x{num:04X}: "
+                               f"{info.hypothesis or 'escala desconhecida'}"
+                               f"  [{info.unit}]",
+                    "pgn_name": f"UDS DID 0x{num:04X}",
+                    # Escala de DID proprietário é hipótese, não norma.
+                    "confiavel": False,
+                })
+        return leituras, vin
+
+    # ════════════════════════════════════════════════════════════════════════
     #  Exportação da documentação
     # ════════════════════════════════════════════════════════════════════════
 
