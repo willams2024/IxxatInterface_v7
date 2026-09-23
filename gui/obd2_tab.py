@@ -56,7 +56,8 @@ from core.can_bus import CANMessage
 from core.obd2 import (
     PID_DATABASE, MODE9_PIDS, ECU_NAMES, PROTOCOL_NOTES, VS_FIELD_DOC,
     LIB_MAX_FILTERS, OBD_REQUEST_FUNCTIONAL, OBD_REQUEST_PHYSICAL_BASE,
-    OBD_RESP_MIN, OBD_RESP_MAX, RESP_MODE_09, build_request,
+    OBD_RESP_MIN, OBD_RESP_MAX, RESP_MODE_09, SUPPORT_PIDS,
+    parse_supported_response, build_request,
     build_mode09_request, decode_mode01_payload, decode_mode09_payload,
     ecu_name, formula_text, build_can_library,
 )
@@ -78,6 +79,9 @@ DOC_DIR = os.path.join(os.path.expanduser("~"), "Documents", "IxxatInterface")
 #   ("did",  0x0101) → UDS $22, DID 0x0101          (proprietário)
 KIND_PID = "pid"
 KIND_PID9 = "pid9"
+# Item interno da varredura de suporte: não tem linha na tabela,
+# porque não é uma grandeza — é a ECU declarando o que implementa.
+KIND_SUP = "sup"
 KIND_DID = "did"
 
 # PIDs e DIDs já marcados ao abrir o programa: os mais usados do OBD-II mais
@@ -146,6 +150,11 @@ class OBD2Tab(QWidget):
         # Modelo do veículo usado na folha "Biblioteca CAN" (o usuário informa
         # na hora de exportar; guardamos para não digitar de novo).
         self._doc_model = "VEICULO"
+        # PIDs que a ECU DECLAROU suportar (varredura de suporte). Vazio = não
+        # perguntamos ainda; a ausência de um PID aqui só significa algo
+        # depois que a varredura rodou (_support_scanned).
+        self._supported: set = set()
+        self._support_scanned = False
 
         self._setup_ui()
 
@@ -186,6 +195,17 @@ class OBD2Tab(QWidget):
         self._btn_none = QPushButton("☐  Desmarcar")
         self._btn_none.clicked.connect(lambda: self._set_all_checked(False))
         hdr.addWidget(self._btn_none)
+
+        self._btn_scan = QPushButton("🔎  Detectar PIDs suportados")
+        self._btn_scan.clicked.connect(self._scan_supported)
+        self._btn_scan.setToolTip(
+            "Pergunta a ECU QUAIS PIDs ela implementa, em vez de descobrir\n"
+            "por tentativa e erro.\n\n"
+            "Sao 7 consultas (PIDs 0x00, 0x20, 0x40...), cada uma devolvendo\n"
+            "um bitmap de 32 PIDs. Ao final, a tabela marca sozinha o que\n"
+            "existe e rotula o resto como nao suportado - leitura declarada\n"
+            "pela propria ECU, nao inferida de silencio.")
+        hdr.addWidget(self._btn_scan)
 
         self._btn_once = QPushButton("📥  Ler Uma Vez")
         self._btn_once.setObjectName("btn_success")
@@ -432,7 +452,7 @@ class OBD2Tab(QWidget):
     def _build_item_request(self, item: tuple, target) -> tuple:
         """Monta (can_id, data) do request do item, conforme o serviço."""
         kind, num = item
-        if kind == KIND_PID:
+        if kind in (KIND_PID, KIND_SUP):
             return build_request(num, target_ecu=target)
         if kind == KIND_PID9:
             return build_mode09_request(num, target_ecu=target)
@@ -490,6 +510,79 @@ class OBD2Tab(QWidget):
                 "Marque ao menos um PID ou DID na coluna 'Ler'.")
             return False
         return True
+
+    @pyqtSlot()
+    def _scan_supported(self):
+        """
+        Pergunta à ECU quais PIDs ela implementa (varredura de suporte).
+
+        Enfileira os 7 PIDs de suporte. Cada resposta é um bitmap de 32 PIDs;
+        ao final, _aplicar_suporte() marca na tabela o que existe e rotula o
+        resto como declarado ausente.
+
+        Por que isso vale: sem a varredura, cada PID inexistente custa o
+        timeout inteiro (1,2 s). Com 24 PIDs no banco e um veículo que
+        implementa poucos, a diferença é de ~40 s de espera para ~2 s de
+        consulta — e o resultado deixa de ser inferido de silêncio.
+        """
+        if self._bus is None or not self._bus.is_connected:
+            QMessageBox.warning(self, "Sem conexão",
+                                "Conecte ao barramento antes de detectar PIDs.")
+            return
+        if (not self._bus.is_simulation) and self._bus.is_listen_only:
+            QMessageBox.warning(
+                self, "Listen-Only ativo",
+                "A detecção precisa TRANSMITIR consultas.\n\n"
+                "Desconecte, DESMARQUE 'Listen-Only' e conecte de novo.")
+            return
+        self._supported = set()
+        self._support_scanned = False
+        # Entra na frente da fila: saber o que existe muda o que vale ler.
+        self._queue = [(KIND_SUP, pid) for pid in SUPPORT_PIDS] + self._queue
+        self._status_msg(
+            f"Detectando PIDs suportados — {len(SUPPORT_PIDS)} consultas…",
+            COLORS['accent'])
+
+    def _aplicar_suporte(self):
+        """
+        Reflete na tabela o que a ECU declarou suportar.
+
+        Marca os PIDs suportados que existem no banco do programa, desmarca e
+        rotula os declarados ausentes. DIDs UDS e o modo 09 não são afetados:
+        o bitmap do modo 01 não fala sobre eles.
+        """
+        self._support_scanned = True
+        no_banco, marcados, ausentes = 0, 0, 0
+        for item, row in self._rows.items():
+            kind, num = item
+            if kind != KIND_PID:
+                continue
+            chk = self._checkbox_at(row)
+            if num in self._supported:
+                no_banco += 1
+                if chk:
+                    chk.setChecked(True)
+                marcados += 1
+                self._set_status(item, "suportado", COLORS['success'])
+            else:
+                if chk:
+                    chk.setChecked(False)
+                ausentes += 1
+                self._set_status(item, "não suportado", COLORS['text_muted'])
+                cell = self._table.item(row, self.COL_STATUS)
+                if cell is not None:
+                    cell.setToolTip(
+                        "A ECU declarou, no bitmap do PID de suporte, que NÃO "
+                        "implementa este PID.\nNão é silêncio: é resposta "
+                        "explícita.")
+        fora = len(self._supported) - no_banco
+        self._status_msg(
+            f"A ECU declara {len(self._supported)} PID(s) suportado(s): "
+            f"{marcados} estão no banco do programa e foram marcados, "
+            f"{ausentes} foram desmarcados como ausentes"
+            + (f". Outros {fora} PID(s) suportados ainda não têm fórmula "
+               f"cadastrada aqui." if fora > 0 else "."),
+            COLORS['success'])
 
     @pyqtSlot()
     def _read_once(self):
@@ -682,6 +775,24 @@ class OBD2Tab(QWidget):
             return
         sid = payload[0]
 
+        # ── Bitmap de PIDs suportados ────────────────────────────────────────
+        # Vem antes do modo 01 comum porque usa o mesmo 0x41, mas não é uma
+        # grandeza: é a ECU declarando o que implementa.
+        sup = parse_supported_response(payload)
+        if sup is not None:
+            base, pids = sup
+            self._supported |= pids
+            if self._inflight is not None and self._inflight["item"] == (KIND_SUP, base):
+                self._inflight = None
+            # Terminou a varredura quando não há mais item de suporte na fila.
+            if not any(k == KIND_SUP for (k, _) in self._queue):
+                self._aplicar_suporte()
+            else:
+                self._status_msg(
+                    f"Detectando PIDs suportados… {len(self._supported)} "
+                    f"declarado(s) até agora.", COLORS['accent'])
+            return
+
         # ── Resposta do OBD-II modo 01 ───────────────────────────────────────
         if sid == 0x41:
             res = decode_mode01_payload(payload)
@@ -749,7 +860,9 @@ class OBD2Tab(QWidget):
                 "count": self._doc_nrc.get(item, {}).get("count", 0) + 1,
             }
             self._set_status(item, f"NRC 0x{nrc:02X}", COLORS['error'])
-            cell = self._table.item(self._rows[item], self.COL_STATUS)
+            linha = self._rows.get(item)   # item de suporte não tem linha
+            cell = (self._table.item(linha, self.COL_STATUS)
+                    if linha is not None else None)
             if cell is not None:
                 cell.setToolTip(f"Resposta negativa da ECU 0x{src:03X}:\n"
                                 f"{res['nrc_name']}")
@@ -864,6 +977,11 @@ class OBD2Tab(QWidget):
         now = time.time()
         if self._doc_start == 0.0:
             self._doc_start = now
+        if item[0] == KIND_SUP:
+            # Consulta de metadado (quais PIDs existem), não de grandeza: não
+            # entra nas tabelas de sinais para não poluir o relatório com
+            # "0x00 sem resposta", que confundiria quem lê.
+            return
         key = (item[0], item[1], can_id)
         rec = self._doc_req.get(key)
         if rec is None:
@@ -1080,6 +1198,11 @@ class OBD2Tab(QWidget):
             ("Flow Control transmitidos",
              f"{self._doc_fc_sent} (respostas multi-frame)"),
             ("Requests sem resposta no prazo", f"{self._doc_timeouts}"),
+            ("PIDs declarados suportados",
+             (f"{len(self._supported)} pelo bitmap do modo 01 "
+              f"(varredura de suporte executada)"
+              if self._support_scanned else
+              "varredura de suporte não executada nesta sessão")),
             ("ECUs que responderam",
              ", ".join(f"0x{s:03X} ({ecu_name(s)})" for s in ecus) or "—"),
             ("Serviços transmitidos",
@@ -1167,6 +1290,11 @@ class OBD2Tab(QWidget):
                 interp = ("A ECU recebeu e RECUSOU a consulta. Veja o código: "
                           "0x31 = não existe neste módulo; 0x33 = exige acesso "
                           "de segurança; 0x7F = exigiria sessão estendida.")
+            elif kind == KIND_PID and self._support_scanned and num not in self._supported:
+                nrc_txt = "—"
+                interp = ("DECLARADO AUSENTE: a ECU informou, no bitmap de PIDs "
+                          "suportados, que não implementa este PID. É resposta "
+                          "explícita, não silêncio.")
             else:
                 nrc_txt = "—"
                 interp = ("Silêncio total: nenhuma ECU respondeu. Provavelmente "

@@ -554,8 +554,19 @@ class CANBus:
             raw = int(max(0, s._odometer) * 10)
             payload = [(raw >> 24) & 0xFF, (raw >> 16) & 0xFF,
                        (raw >> 8) & 0xFF, raw & 0xFF]
-        elif pid == 0x00:    # PIDs suportados 01-20 (bitmap) — devolve alguns
-            payload = [0x18, 0x3B, 0x80, 0x13]
+        elif pid in (0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0):
+            # PIDs de suporte: devolve o bitmap COERENTE com o que esta
+            # simulação de fato responde, para que a varredura de suporte
+            # possa ser testada de ponta a ponta sem veículo.
+            from core.obd2 import encode_supported_pids
+            implementados = {0x05, 0x0C, 0x0D, 0x0F, 0x11, 0x2F, 0x42,
+                             0x45, 0x49, 0xA6}
+            # Marca também o PID que anuncia o próximo bloco, quando ainda há
+            # algo implementado adiante (é assim que a ECU real encadeia).
+            for prox in (0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0):
+                if any(p > prox for p in implementados):
+                    implementados.add(prox)
+            payload = encode_supported_pids(pid, implementados)
         if payload is None:
             return
         resp = [len(payload) + 2, 0x41, pid] + payload

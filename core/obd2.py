@@ -223,6 +223,75 @@ def build_request(pid: int, target_ecu: Optional[int] = None) -> tuple[int, byte
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  PIDs DE SUPORTE — o veículo declara o que implementa
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Em vez de perguntar PID por PID e esperar o timeout de cada um que não
+# existe, a norma prevê que a ECU DECLARE quais PIDs implementa. Cada PID de
+# suporte devolve 4 bytes = 32 bits, um por PID da faixa seguinte:
+#
+#   PID 0x00 -> bitmap dos PIDs 0x01..0x20
+#   PID 0x20 -> bitmap dos PIDs 0x21..0x40
+#   PID 0x40 -> bitmap dos PIDs 0x41..0x60   ... e assim por diante
+#
+# O bit mais significativo do primeiro byte corresponde ao PRIMEIRO PID da
+# faixa. O último bit de cada bitmap indica se o próximo bloco existe — por
+# isso a varredura pode parar assim que um bloco não for suportado.
+#
+# Ganho prático: 7 consultas respondem "o que este veículo entrega", contra
+# uma varredura de dezenas de PIDs em que a maioria só produz timeout. E o
+# resultado é DECLARADO pela ECU, não inferido de silêncio.
+
+SUPPORT_PIDS = (0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0)
+
+
+def decode_supported_pids(base_pid: int, data: bytes) -> set:
+    """
+    Decodifica o bitmap de PIDs suportados devolvido por um PID de suporte.
+
+    `base_pid` é o PID consultado (0x00, 0x20, …) e `data` são os 4 bytes de
+    dados da resposta. Devolve o conjunto de PIDs declarados como suportados
+    na faixa base_pid+1 .. base_pid+32.
+    """
+    if len(data) < 4:
+        return set()
+    valor = int.from_bytes(bytes(data[:4]), "big")
+    # Bit 31 (o mais significativo) = primeiro PID da faixa.
+    return {base_pid + 1 + i for i in range(32) if valor & (1 << (31 - i))}
+
+
+def encode_supported_pids(base_pid: int, suportados: set) -> list:
+    """
+    Monta o bitmap de 4 bytes a partir de um conjunto de PIDs.
+
+    Inverso de decode_supported_pids(); usado pela simulação para responder de
+    forma coerente com os PIDs que ela de fato implementa.
+    """
+    valor = 0
+    for i in range(32):
+        if (base_pid + 1 + i) in suportados:
+            valor |= 1 << (31 - i)
+    return [(valor >> 24) & 0xFF, (valor >> 16) & 0xFF,
+            (valor >> 8) & 0xFF, valor & 0xFF]
+
+
+def parse_supported_response(payload: bytes):
+    """
+    Interpreta um payload de resposta do modo 01 que seja bitmap de suporte.
+
+    Devolve (base_pid, conjunto_de_pids) quando o payload é `41 <PID de
+    suporte> <4 bytes>`, ou None quando não é esse caso. Existe separado de
+    decode_mode01_payload() porque os PIDs de suporte não têm fórmula nem
+    unidade — não são grandezas, são metadados.
+    """
+    if len(payload) < 6:
+        return None
+    if payload[0] != 0x41 or payload[1] not in SUPPORT_PIDS:
+        return None
+    return payload[1], decode_supported_pids(payload[1], payload[2:6])
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  MODO 09 — INFORMAÇÕES DO VEÍCULO (chassi, Cal ID, nome da ECU)
 # ════════════════════════════════════════════════════════════════════════════
 #
